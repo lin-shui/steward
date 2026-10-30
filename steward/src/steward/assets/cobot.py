@@ -51,6 +51,19 @@ _PIPER_FINGERS: list[dict] = [
 # hand_camera_joint, verbatim from the URDF (mount frame convention: looks along +x).
 _PIPER_HAND_CAMERA = dict(xyz=[0.0, 0.075, 0.03], rpy=[0.0, -0.3, 1.57])
 
+# Grasp geometry, measured in the simulation at the open-aperture posture (see tests/test_cobot.py):
+# the pinch point sits 0.135 m along link6's +z, and the fingers separate along link6's y axis,
+# 0.05 m per finger. Closed means both finger joints at 0 (the URDF ranges are 0..0.05 and
+# -0.05..0), so the aperture is the distance travelled from 0.
+TCP_OFFSET = [0.0, 0.0, 0.135]   # in the link6 frame, for either arm
+FINGER_OPEN = 0.05               # per finger, metres from closed
+FINGER_CLOSED = 0.0
+
+# A natural parked posture (joint1..joint6): the arm folds forward and slightly up, clear of the
+# table. The all-zero URDF posture is a folded singularity where IK has no useful gradient, so the
+# twin starts here instead; joints 7/8 start open.
+HOME = [0.0, 1.57, -1.35, 0.0, 0.0, 0.0]
+
 # Per-link capsule spec: link id -> (offset to the next joint origin in this link's frame,
 # capsule radius, mass). None -> a sphere at the origin. Fingers are visual-only.
 _PIPER_LINKS: dict[str, tuple] = {
@@ -89,18 +102,19 @@ def _quat_z_to(direction: np.ndarray) -> list[float]:
     return quat_from_axis_angle(axis / s, math.atan2(s, c))
 
 
-def _link_geometry(spec: tuple, rgba: list[float]) -> dict[str, list[dict]]:
+def _link_geometry(spec: tuple, rgba: list[float], collision: bool = True) -> dict[str, list[dict]]:
+    key = "collision" if collision else "visual"
     offset, radius, _ = spec
     if offset is None:
-        return {"collision": [primitive("sphere", [radius], None, rgba)]}
+        return {key: [primitive("sphere", [radius], None, rgba)]}
     a = np.zeros(3)
     b = np.asarray(offset, dtype=float)
     length = float(np.linalg.norm(b - a))
     if length < 1e-6:
-        return {"collision": [primitive("sphere", [radius], None, rgba)]}
+        return {key: [primitive("sphere", [radius], None, rgba)]}
     center = (a + b) / 2.0
     at = pose([float(v) for v in center], _quat_z_to(b / length))
-    return {"collision": [primitive("capsule", [radius, length], at, rgba)]}
+    return {key: [primitive("capsule", [radius, length], at, rgba)]}
 
 
 def _piper_arm(prefix: str, mount_p: list[float], camera: bool = True,
@@ -112,8 +126,12 @@ def _piper_arm(prefix: str, mount_p: list[float], camera: bool = True,
         if name in ("link7", "link8"):
             continue
         lid = f"{prefix}_{name}"
-        affordances = [exact("grasp-point")] if name == "link6" else None
-        link = Link(id=lid, name=f"{prefix} {name}", geometry=_link_geometry(spec, ROBOT_ARM),
+        affordances = [exact("grasp-point"), exact({"tcp-offset": {"p": TCP_OFFSET, "q": [1.0, 0.0, 0.0, 0.0]}})] \
+            if name == "link6" else None
+        # The wrist (link6) is visual only: its capsule spans the gap to the pinch point, so a
+        # colliding wrist would shove aside the very object the fingers are closing on. The same
+        # reasoning the mobile robot uses for its whole arm.
+        link = Link(id=lid, name=f"{prefix} {name}", geometry=_link_geometry(spec, ROBOT_ARM, collision=name != "link6"),
                     inertial=exact({"mass": spec[2]}), affordances=affordances or [])
         if name == "link6" and camera:
             cam = _PIPER_HAND_CAMERA
@@ -127,12 +145,13 @@ def _piper_arm(prefix: str, mount_p: list[float], camera: bool = True,
             joints.append(Joint(id=f"{prefix}_mount", parent="frame", child=lid, type=exact("fixed"),
                                 origin=exact(pose(mount_p)), q=exact([]), qd=exact([])))
     for j in _PIPER_CHAIN:
+        index = int(j["jid"][-1]) - 1
         joints.append(Joint(
             id=f"{prefix}_{j['jid']}", parent=f"{prefix}_{j['parent']}", child=f"{prefix}_{j['child']}",
             type=exact("revolute"), origin=exact(pose(j["xyz"], _rpy_quat(j["rpy"]))),
             axis=exact([0.0, 0.0, 1.0]), limits=exact({"lo": j["lo"], "hi": j["hi"]}),
-            q=exact([0.0]), qd=exact([0.0]), dynamics=exact({"damping": 2.0}),
-            actuator={"kind": "position", "limits": {"effort": 100.0, "velocity": 3.0}, "gains": {"kp": 50.0}}))
+            q=exact([HOME[index]]), qd=exact([0.0]), dynamics=exact({"damping": 60.0}),
+            actuator={"kind": "position", "limits": {"effort": 100.0, "velocity": 3.0}, "gains": {"kp": 1500.0}}))
     for name, spec in _PIPER_LINKS.items():
         if name not in ("link7", "link8"):
             continue
@@ -146,7 +165,8 @@ def _piper_arm(prefix: str, mount_p: list[float], camera: bool = True,
             id=f"{prefix}_{j['jid']}", parent=f"{prefix}_link6", child=f"{prefix}_{j['child']}",
             type=exact("prismatic"), origin=exact(pose(j["xyz"], _rpy_quat(j["rpy"]))),
             axis=exact(j["axis"]), limits=exact({"lo": j["lo"], "hi": j["hi"]}),
-            q=exact([0.0]), qd=exact([0.0]), dynamics=exact({"damping": 5.0}),
+            q=exact([FINGER_OPEN if int(j["jid"][-1]) == 7 else -FINGER_OPEN]), qd=exact([0.0]),
+            dynamics=exact({"damping": 5.0}),
             actuator={"kind": "position", "limits": {"effort": 100.0, "velocity": 1.0}, "gains": {"kp": 100.0}}))
     return links, joints
 
@@ -161,8 +181,11 @@ def cobot_magic(separation: float = 0.62, mount_height: float = 0.79,
     """
     frame = Link(
         id="frame", name="cobot magic frame",
-        geometry={"collision": [primitive("box", [0.60, separation + 0.55, mount_height],
-                                          pose([0.0, 0.0, mount_height / 2]), ROBOT_BODY)]},
+        # A slim back column rather than a full-depth box: the workspace in front of the arms is
+        # table, and a vertical tool can only reach down onto it about 0.2-0.35 m out, so the
+        # frame must stay behind that band.
+        geometry={"collision": [primitive("box", [0.25, separation + 0.55, mount_height],
+                                          pose([-0.095, 0.0, mount_height / 2]), ROBOT_BODY)]},
         inertial=exact({"mass": 40.0}),
         sensors=[{
             "id": "top_camera", "kind": "rgbd",

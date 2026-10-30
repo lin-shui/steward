@@ -8,16 +8,17 @@ The solver freezes every DOF outside the arm being solved — the other arm's jo
 fingers — so a left-arm goal never drags the right arm along. Joint limits come from the model
 (:class:`mink.ConfigurationLimit`), so a solution is always inside the URDF ranges.
 
-Frames: the end-effector frame of an arm is its last revolute link (``L_link6`` / ``R_link6``),
-whose +x axis points out of the gripper, matching the sensor mount convention everywhere else
-in steward.
+Frames: the end-effector frame of an arm is its last revolute link (``L_link6`` / ``R_link6``).
+Its +z axis points out through the pinch point, 0.135 m away (``assets.cobot.TCP_OFFSET``), and
+the fingers separate along its y axis; the result is measured, not assumed — see
+``tests/test_cobot.py::test_tcp_is_where_the_fingers_pinch``.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from steward.assets.cobot import cobot_magic
+from steward.assets.cobot import HOME, cobot_magic
 from steward.scene.mjcf import build_mjcf
 from steward.scene.schema import SceneState
 
@@ -44,6 +45,9 @@ class CobotIK:
         build = build_mjcf(SceneState(mode="world", entities=[_as_entity(ent)]), timestep=timestep)
         self.model = build.compile()
         self.data = mink.Configuration(self.model)
+        # mink starts from a zero posture; the twin starts from the URDF's home, and FK must agree
+        # with the simulation before the first solve.
+        self.data.update(np.asarray(self.model.qpos0, dtype=float))
         self.dt = timestep
         self._arms = {}
         for arm in ARMS:
@@ -88,6 +92,15 @@ class CobotIK:
         spec = self._arms[self._check(arm)]
         q = self.data.q
         return [float(q[a]) for a in spec["qadr"]]
+
+    def set_joints(self, arm: str, joints: list[float]) -> None:
+        """Seed the solver from measured joint angles (the robot's encoders, not a past solution)."""
+        spec = self._arms[self._check(arm)]
+        _check_len(joints, _DOF_PER_ARM, f"{arm} arm joints")
+        q = np.array(self.data.q, dtype=float)
+        for qadr, value in zip(spec["qadr"], joints, strict=True):
+            q[qadr] = value
+        self.data.update(q)
 
     def fk(self, arm: str, joints: list[float] | None = None) -> dict:
         """End-effector pose ``{p: [x, y, z], q: wxyz}`` in the world frame."""
@@ -158,6 +171,44 @@ class CobotIK:
             return False
         return True
 
+    def solve_tool(self, arm: str, position: list[float], orientation: list[float],
+                   max_tilt: float = 0.6, q_init: list[float] | None = None) -> tuple[list[float], float]:
+        """Reach ``position`` preferring ``orientation``, but accepting a tilt up to ``max_tilt``.
+
+        The Piper wrist has a +-70 deg roll joint (joint5), so a strictly vertical tool is only
+        reachable in a narrow band in front of the base; a real pick tilts the tool a little
+        instead of refusing. Returns ``(joints, tilt_radians)``; the tilt is 0 when the strict
+        orientation was reached.
+
+        Seeds are tried in order — the caller's posture, then the home and mid-range postures —
+        because a 6-DoF solve started from a folded posture can miss a reachable goal entirely.
+        The strict orientation wins outright when any seed reaches it; otherwise the least-tilted
+        solution within ``max_tilt`` is returned.
+        """
+        seeds = [self.current(arm) if q_init is None else list(q_init), list(HOME), self.neutral(arm)]
+        strict_errors: list[str] = []
+        for seed in seeds:
+            try:
+                return self.solve(arm, position, orientation, q_init=seed), 0.0
+            except IkError as exc:
+                strict_errors.append(str(exc))
+        best: tuple[list[float], float] | None = None
+        position_errors: list[str] = []
+        for seed in seeds:
+            try:
+                joints = self.solve(arm, position, None, q_init=seed)
+            except IkError as exc:
+                position_errors.append(str(exc))
+                continue
+            tilt = _angle_between(self.fk(arm, joints)["q"], orientation)
+            if tilt <= max_tilt and (best is None or tilt < best[1]):
+                best = (joints, tilt)
+        if best is not None:
+            return best
+        detail = position_errors[-1] if position_errors else strict_errors[-1]
+        raise IkError(f"{arm} arm cannot reach {[round(v, 3) for v in position]} in a usable tool "
+                      f"orientation: {detail}")
+
     # ------------------------------------------------------------------ private
     def _errors(self, arm: str, position: list[float], orientation: list[float] | None) -> tuple[float, float]:
         pose = self.data.get_transform_frame_to_world(self._arms[arm]["ee"], "body")
@@ -211,3 +262,9 @@ def _quat_from_matrix(m: np.ndarray) -> list[float]:
     from steward.math3d import quat_from_matrix as _qf
 
     return [float(v) for v in _qf(np.asarray(m, dtype=float))]
+
+
+def _angle_between(a: list[float], b: list[float]) -> float:
+    """Angle between two orientations, in radians (0 when identical)."""
+    dot = abs(float(np.dot(np.asarray(a, dtype=float), np.asarray(b, dtype=float))))
+    return 2.0 * float(np.arccos(min(1.0, dot)))

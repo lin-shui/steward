@@ -120,6 +120,22 @@ def _gripper_links(ent) -> list[str]:
     return [link.id for link in ent.rigid.links if any(a.value == "grasp-point" for a in link.affordances)]
 
 
+def _finger_joints(ent, gripper_link: str) -> list[tuple[str, float, float]]:
+    """Finger joints of a gripper: ``(joint id, closed target, open target)``.
+
+    A finger is a prismatic joint whose parent is the gripper link. Its closed position is 0 when
+    the range contains it (the Piper URDF has 0..0.05 and -0.05..0), so the open position is the
+    range end farthest from 0."""
+    out = []
+    for joint in ent.rigid.joints:
+        if joint.parent != gripper_link or joint.type.value != "prismatic":
+            continue
+        lo, hi = joint.limits.value["lo"], joint.limits.value["hi"]
+        closed = 0.0 if lo <= 0.0 <= hi else (lo if abs(lo) < abs(hi) else hi)
+        out.append((joint.id, closed, hi if closed == lo else lo))
+    return out
+
+
 def _robot_state(ent) -> _RobotState:
     return _RobotState(ent.id, {lid: _GripState() for lid in _gripper_links(ent)})
 
@@ -453,9 +469,11 @@ class WorldSim:
                         raise KeyError(f"robot {robot_id!r} has no gripper link {link_id!r}")
                     if action == "close" and not g.closed:
                         g.closed = True
+                        self._set_fingers(rs, link_id, closed=True)
                         self._try_attach(rs, g, link_id)
                     elif action == "open" and g.closed:
                         g.closed = False
+                        self._set_fingers(rs, link_id, closed=False)
                         self._release(rs, g)
             return {"ok": True, "t": self.time}
 
@@ -464,6 +482,15 @@ class WorldSim:
         if len(rs.grippers) != 1:
             raise KeyError(f"robot {rs.entity_id!r} has grippers {sorted(rs.grippers)}; address one by link id")
         return next(iter(rs.grippers))
+
+    def _set_fingers(self, rs: _RobotState, gripper_link: str, closed: bool) -> None:
+        """Drive a gripper's finger joints to their closed or open target (no-op without fingers)."""
+        ent = self.template.entity(rs.entity_id)
+        names = self.build.names[rs.entity_id]
+        for joint_id, shut, open_ in _finger_joints(ent, gripper_link):
+            actuator = names.actuators.get(joint_id)
+            if actuator is not None:
+                self._set_ctrl(actuator, shut if closed else open_)
 
     def _set_ctrl(self, actuator: str, value: float) -> None:
         aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator)
@@ -485,10 +512,27 @@ class WorldSim:
                                 self.build.names[robot_id].bodies[gripper_link])
         return {"p": self.data.xpos[bid].tolist(), "q": self.data.xquat[bid].tolist()}
 
+    def grasp_point(self, robot_id: str, gripper_link: str | None = None) -> dict:
+        """Where a gripper actually pinches: its link pose offset by a declared ``tcp-offset``.
+
+        A visual-only gripper (the mobile kitchen robot) declares none, so the pinch point is the
+        link origin; a real parallel gripper's fingers sit ahead of the wrist link."""
+        rs = self._robot(robot_id)
+        if gripper_link is None:
+            gripper_link = self._sole_gripper(rs)
+        pose = self.gripper_pose(robot_id, gripper_link)
+        ent = self.template.entity(robot_id)
+        link = ent.rigid.link(gripper_link)
+        for affordance in getattr(link, "affordances", []) or []:
+            value = affordance.value
+            if isinstance(value, dict) and "tcp-offset" in value:
+                return pose_compose(pose, value["tcp-offset"])
+        return pose
+
     def _try_attach(self, rs: _RobotState, g: _GripState, gripper_link: str) -> None:
         """Ideal grasp: attach the nearest free object within capture range that has nothing resting
         on or in it (the top of a stack), or else grasp the nearest drawer handle."""
-        grip = np.asarray(self.gripper_pose(rs.entity_id, gripper_link)["p"])
+        grip = np.asarray(self.grasp_point(rs.entity_id, gripper_link)["p"])
         supporting = {r.b["entity"] for r in self._relations()
                       if r.type == "supported-by" and self.template.entity(r.a["entity"]).rigid.root.value == "free"}
         best, best_d = None, self.grasp.capture_radius
@@ -558,7 +602,7 @@ class WorldSim:
                 h = g.handle
                 if h is None:
                     continue
-                grip = np.asarray(self.gripper_pose(rs.entity_id, h["gripper"])["p"])
+                grip = np.asarray(self.grasp_point(rs.entity_id, h["gripper"])["p"])
                 target = min(max(h["q0"] + float((grip - np.asarray(h["grip0"])) @ np.asarray(h["axis"])), h["lo"]), h["hi"])
                 q, qd = self.data.qpos[h["qadr"]], self.data.qvel[h["dof"]]
                 self.data.qfrc_applied[h["dof"]] = self.grasp.handle_kp * (target - q) - self.grasp.handle_kd * qd

@@ -75,9 +75,9 @@ def _cobot_scene(bowl_at: list[float] | None = None) -> dict:
 
 
 def test_sim_generic_joints_and_dual_gripper_grasp() -> None:
-    # First load locates the left gripper in the world; the second places a bowl within capture.
+    # First load locates the left pinch point in the world; the second places a bowl on it.
     probe = WorldSim(_cobot_scene())
-    grip = probe.gripper_pose("w:cobot", "L_link6")
+    grip = probe.grasp_point("w:cobot", "L_link6")
     bowl_at = [grip["p"][0] + 0.02, grip["p"][1], grip["p"][2] - 0.03]
 
     sim = WorldSim(_cobot_scene(bowl_at))
