@@ -102,11 +102,10 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
             raise
         except SkillFailed as exc:
             log.append(f"attempt {attempt} failed: {exc}")
-            self_holding = (est.gripper or {}).get("holding") or self._holding(skills, grip)
-            if self_holding:
+            if (est.gripper or {}).get("holding") or _holding(skills, grip):
                 # Put the load down where it is: a retry that reaches for an object still in the
                 # gripper can only fail, and leaving it held hides the failure from the operator.
-                _run(skills, "open", {"grip": grip}, log)
+                _run(skills, "open", {"gripper": grip}, log)
                 log.append(f"attempt {attempt}: put the load down where it was held")
             continue
         return {"ok": True, "attempts": attempt, "bowl": bowl.pos.tolist(), "plate": plate.pos.tolist(), "log": log}

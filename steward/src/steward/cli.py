@@ -357,7 +357,7 @@ def cmd_cobot(args) -> int:
 
     def run_sensed_mission() -> None:
         rounds = args.rounds
-        done = 0
+        done, crashes = 0, 0
         while True:
             try:
                 result = bowl_onto_plate(est, skills, sensed_frame, rgbd=rgbd)
@@ -365,9 +365,13 @@ def cmd_cobot(args) -> int:
                 print(json.dumps({"mission": "bowl-on-plate", "round": done + 1, **result},
                                  ensure_ascii=False), flush=True)
             except Exception as exc:  # noqa: BLE001 - reported to the operator, console stays up
+                crashes += 1
                 outcome["error"] = f"{type(exc).__name__}: {exc}"
-                print(json.dumps(outcome, ensure_ascii=False), flush=True)
-                return
+                print(json.dumps({"round": done + 1, **outcome}, ensure_ascii=False), flush=True)
+                if args.rounds or crashes >= 3:
+                    return  # a single-shot run reports the error; a loop stops only if it repeats
+            else:
+                crashes = 0
             done += 1
             if rounds and done >= rounds:
                 return

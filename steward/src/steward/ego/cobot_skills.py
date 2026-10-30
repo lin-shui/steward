@@ -124,7 +124,7 @@ class CobotSkills:
             elif skill == "push":
                 self.push(job, plan)
             elif skill in ("open", "close"):
-                self.gripper(job, plan["gripper"], close=(skill == "close"))
+                self.gripper(job, plan.get("gripper") or plan.get("grip"), close=(skill == "close"))
             else:
                 raise SkillFailed(f"unknown skill {skill}")
             job.state, job.message = "succeeded", job.message or f"{skill} completed"

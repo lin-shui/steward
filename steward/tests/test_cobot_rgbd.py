@@ -67,3 +67,29 @@ def test_mission_runs_on_rgbd_perception(rig) -> None:
     plate = _truth(sim, "w:plate-1")
     assert np.linalg.norm(np.subtract(bowl[:2], plate[:2])) < 0.06, f"bowl {bowl} is not on {plate}"
     assert bowl[2] > plate[2] + 0.005
+
+
+def test_a_failed_grasp_is_reported_not_raised(rig) -> None:
+    """Every attempt failing must come back as ok=False; the retry path once raised NameError."""
+    sim, est, _, frame = rig
+
+    class _Job:
+        state = "failed"
+        message = "the gripper closed on nothing"
+        log: list = []
+
+    class _Stub:
+        """A body whose grasp always misses, and which can still let go."""
+
+        def start(self, name, receipt):
+            job = _Job()
+            if name == "open":
+                job.state = "succeeded"
+            return job
+
+        def _state(self):
+            return {"grippers": {"L_link6": {"state": "closed", "holding": False}}}
+
+    result = bowl_onto_plate(est, _Stub(), frame, rgbd=True)
+    assert result["ok"] is False
+    assert any("failed" in line for line in result["log"])
