@@ -89,7 +89,12 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
         if not _arm_can_reach(skills, bowl.pos):
             log.append(f"attempt {attempt}: the bowl at {_fmt(bowl.pos)} is outside the left arm's workspace")
             continue
-        target = [float(plate.pos[0]), float(plate.pos[1]), float(plate.pos[2] + 0.02)]
+        # Set the bowl down on the plate's top surface, from the sizes the robot measured: placing
+        # it at the plate's *centre* puts the bowl's base through the plate, and every round then
+        # shoves the plate a couple of centimetres until the bowl hides it from the camera.
+        plate_top = float(plate.pos[2]) + 0.5 * _extent(plate.size, 2, 0.01)
+        target = [float(plate.pos[0]), float(plate.pos[1]),
+                  plate_top + 0.5 * _extent(bowl.size, 2, 0.05) + 0.005]
         try:
             _run(skills, "pick", {"grip": grip, "arm": "L", "at": [float(v) for v in bowl.pos]}, log)
             _run(skills, "place", {"grip": grip, "arm": "L", "at": target}, log)
@@ -115,6 +120,15 @@ def _run(skills: CobotSkills, name: str, plan: dict, log: list[str]) -> None:
     log.extend(f"{name}: {line}" for line in job.log)
     if job.state != "succeeded":
         raise SkillFailed(job.message or job.state)
+
+
+def _extent(size, axis: int, fallback: float) -> float:
+    """One dimension of a measured box, with a fallback when the estimate did not carry sizes."""
+    try:
+        value = float(size[axis])
+    except (IndexError, TypeError, ValueError):
+        return fallback
+    return value if value > 1e-4 else fallback
 
 
 def _arm_can_reach(skills: CobotSkills, pos: np.ndarray) -> bool:

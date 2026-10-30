@@ -86,6 +86,8 @@ def _require_free(ports: dict[str, int]) -> None:
         if not port:
             continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            # A port a previous run left in TIME_WAIT is free for us; only a live listener is not.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("127.0.0.1", port))
             except OSError:
@@ -307,6 +309,30 @@ def cmd_cobot(args) -> int:
                       "runDir": str(run_dir)}, ensure_ascii=False), flush=True)
 
     outcome: dict = {}
+    bowl_home = next(list(e["pose"]["value"]["p"]) for e in sim.world_state()["entities"]
+                     if e["id"] == "w:bowl-1")
+
+    def reset_for_next_round() -> None:
+        """Park the arm, put the bowl back where the round started, and let the robot look again.
+
+        Parking first is not cosmetic: a round ends with the hand over the plate it just left, and
+        the overhead camera then sees the forearm instead of the plate -- the next round would
+        start blind. The bowl's move is a world edit by the round driver, so the belief is told to
+        start over rather than being left to decide on its own that a bowl teleported."""
+        from steward.assets.cobot import HOME
+
+        try:
+            # Command the park and let physics settle rather than waiting for a skill to converge:
+            # the point is only to get the forearm out of the overhead camera's way, and the next
+            # motion re-seeds its IK from the encoders anyway.
+            sim.command(robot_id, {"joints": dict(zip(skills.ik.joint_names("L"), HOME, strict=True))})
+            sim.step_seconds(1.2)
+            sim.edit_move("w:bowl-1", {"at": {"x": bowl_home[0], "y": bowl_home[1], "z": bowl_home[2]}})
+        except Exception as exc:  # noqa: BLE001 - a stuck reset must not end the loop
+            print(json.dumps({"reset": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False), flush=True)
+            return
+        est.tracks.clear()
+        sim.step(30)
 
     def run_truth_mission() -> None:
         """Escape hatch for debugging the skills: aim at the true object poses."""
@@ -330,13 +356,23 @@ def cmd_cobot(args) -> int:
         outcome["done"] = True
 
     def run_sensed_mission() -> None:
-        try:
-            result = bowl_onto_plate(est, skills, sensed_frame, rgbd=rgbd)
-            outcome.update(result)
-            print(json.dumps({"mission": "bowl-on-plate", **result}, ensure_ascii=False), flush=True)
-        except Exception as exc:  # noqa: BLE001 - reported to the operator, console stays up
-            outcome["error"] = f"{type(exc).__name__}: {exc}"
-            print(json.dumps(outcome, ensure_ascii=False), flush=True)
+        rounds = args.rounds
+        done = 0
+        while True:
+            try:
+                result = bowl_onto_plate(est, skills, sensed_frame, rgbd=rgbd)
+                outcome.update(result)
+                print(json.dumps({"mission": "bowl-on-plate", "round": done + 1, **result},
+                                 ensure_ascii=False), flush=True)
+            except Exception as exc:  # noqa: BLE001 - reported to the operator, console stays up
+                outcome["error"] = f"{type(exc).__name__}: {exc}"
+                print(json.dumps(outcome, ensure_ascii=False), flush=True)
+                return
+            done += 1
+            if rounds and done >= rounds:
+                return
+            time.sleep(1.0)
+            reset_for_next_round()
 
     worker = threading.Thread(target=run_truth_mission if args.ground_truth else run_sensed_mission,
                               name="cobot-mission", daemon=True)
@@ -576,6 +612,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "cobot":
             p.add_argument("--ground-truth", action="store_true",
                            help="aim the skills at true object poses instead of the robot's estimates (debugging)")
+            p.add_argument("--rounds", type=int, default=0,
+                           help="rounds of bowl-on-plate to run; 0 repeats until Ctrl-C (default)")
             p.add_argument("--api", help="Ego API of a running `steward up`; omit to run in-process")
             p.add_argument("--wca", default="http://127.0.0.1:7400", help="WCA of the running world (with --api)")
         p.set_defaults(fn=fn)
