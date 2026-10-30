@@ -1011,8 +1011,15 @@ class EgoEstimator:
         self.version += 1
         return carried
 
-    def to_scene(self) -> SceneState:
-        entities = [self._self_entity()]
+    def to_scene(self, self_frame: dict | None = None) -> SceneState:
+        """The Ego State as a scene.
+
+        ``self_frame`` is the robot's *current* sensor frame, when the caller has one. Proprioception
+        is continuous — the robot knows its joint angles without looking — so a console can show the
+        arm where it is now while the object beliefs stay as old as the last look. Object tracks are
+        never refreshed by it.
+        """
+        entities = [self._self_entity(self_frame)]
         relations: list[Relation] = []
         for track in self.tracks.values():
             entities.append(self._track_entity(track))
@@ -1027,20 +1034,23 @@ class EgoEstimator:
         return SceneState(mode="ego", entities=entities, relations=relations, version=self.version, stamp=self.stamp,
                           self_id=SELF_ID)
 
-    def _self_entity(self) -> Entity:
+    def _self_entity(self, frame: dict | None = None) -> Entity:
         ent = Entity.from_dict(self._self_template)
+        joints = self.joints if frame is None else (frame.get("joints") or self.joints)
+        gripper = self.gripper if frame is None else (frame.get("gripper") or self.gripper)
+        stamp = self.stamp if frame is None else float(frame.get("stamp", self.stamp))
         o = self.odometry
         pos_var = o["sigma"]["pos"] ** 2
         yaw_var = o["sigma"]["yaw"] ** 2
         ent.pose = Est(value=self.base_pose(), unc=_gaussian6([pos_var, pos_var, 1e-8, 1e-8, 1e-8, yaw_var]),
-                       t=self.stamp, src="observed")
+                       t=stamp, src="observed")
         tree: RigidTree = ent.body
         for joint in tree.joints:
-            if joint.id in self.joints:
-                joint.q = Est(value=[self.joints[joint.id]], unc={"kind": "gaussian", "cov": [1e-6]}, t=self.stamp,
+            if joint.id in joints:
+                joint.q = Est(value=[joints[joint.id]], unc={"kind": "gaussian", "cov": [1e-6]}, t=stamp,
                               src="observed")
-        ent.state_vars["gripper"] = Est(value=self.gripper["state"], t=self.stamp, src="observed")
-        ent.state_vars["holding"] = Est(value=self.gripper.get("holding", False), t=self.stamp, src="observed")
+        ent.state_vars["gripper"] = Est(value=gripper["state"], t=stamp, src="observed")
+        ent.state_vars["holding"] = Est(value=gripper.get("holding", False), t=stamp, src="observed")
         return ent
 
     def _track_entity(self, track: Track) -> Entity:

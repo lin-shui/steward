@@ -16,9 +16,12 @@ the fingers separate along its y axis; the result is measured, not assumed — s
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
-from steward.assets.cobot import HOME, cobot_magic
+from steward.assets.cobot import HOME, TCP_OFFSET, cobot_magic
+from steward.math3d import quat_angle_between
 from steward.scene.mjcf import build_mjcf
 from steward.scene.schema import SceneState
 
@@ -28,6 +31,12 @@ ARMS = ("L", "R")
 _ENT = "w:robot"  # entity id used to compile the robot-only model; MJCF names are prefixed with it
 _DOF_PER_ARM = 6
 _FINGER_JOINTS = ("joint7", "joint8")
+
+# Tool poses tried when the requested one is out of the wrist's range: turns about the tool's own
+# axis (they move the wrist, not the pinch point), then tilts from a ring of directions.
+_TURNS = (0.5, -0.5, 1.0, -1.0, 1.6, -1.6, math.pi)
+_TILT_FRACTIONS = (0.35, 0.6, 0.85, 1.0)
+_TILT_AZIMUTHS = 8
 
 
 class IkError(RuntimeError):
@@ -176,14 +185,20 @@ class CobotIK:
         """Reach ``position`` preferring ``orientation``, but accepting a tilt up to ``max_tilt``.
 
         The Piper wrist has a +-70 deg roll joint (joint5), so a strictly vertical tool is only
-        reachable in a narrow band in front of the base; a real pick tilts the tool a little
-        instead of refusing. Returns ``(joints, tilt_radians)``; the tilt is 0 when the strict
-        orientation was reached.
+        reachable in a narrow band in front of the base; a real pick turns the tool about its own
+        axis, or tilts it a little, instead of refusing. Returns ``(joints, tilt_radians)``; the
+        tilt is 0 when the strict orientation was reached.
 
-        Seeds are tried in order — the caller's posture, then the home and mid-range postures —
-        because a 6-DoF solve started from a folded posture can miss a reachable goal entirely.
-        The strict orientation wins outright when any seed reaches it; otherwise the least-tilted
-        solution within ``max_tilt`` is returned.
+        What is held fixed is the *pinch point* — ``position`` plus ``TCP_OFFSET`` along the tool
+        axis — not the end-effector origin. A tilted tool has to move its wrist the other way by
+        ``TCP_OFFSET * sin(tilt)``, or the fingers close up to 8.7 cm away from the object while
+        every position report still reads "at the target". That displacement is what used to make
+        a reachable place miss by 5 cm and then walk its descent into an unreachable waypoint.
+
+        Turning the tool about its own axis moves the wrist a long way and the pinch point not at
+        all, so the turn candidates come first; the tilt sweep follows only if every turn fails.
+        Seeds are tried in order — the caller's posture, then home — because a 6-DoF solve started
+        from a folded posture can miss a reachable goal entirely.
         """
         seeds = [self.current(arm) if q_init is None else list(q_init), list(HOME), self.neutral(arm)]
         strict_errors: list[str] = []
@@ -192,20 +207,23 @@ class CobotIK:
                 return self.solve(arm, position, orientation, q_init=seed), 0.0
             except IkError as exc:
                 strict_errors.append(str(exc))
-        best: tuple[list[float], float] | None = None
-        position_errors: list[str] = []
-        for seed in seeds:
-            try:
-                joints = self.solve(arm, position, None, q_init=seed)
-            except IkError as exc:
-                position_errors.append(str(exc))
-                continue
-            tilt = _angle_between(self.fk(arm, joints)["q"], orientation)
-            if tilt <= max_tilt and (best is None or tilt < best[1]):
-                best = (joints, tilt)
-        if best is not None:
-            return best
-        detail = position_errors[-1] if position_errors else strict_errors[-1]
+        pinch = _along(orientation, position, 1.0)
+        failures: list[str] = []
+        for turn, tilt, azimuth in _tool_candidates(max_tilt):
+            tool = _turn_and_tilt(orientation, turn, tilt, azimuth)
+            wrist = _along(tool, pinch, -1.0)
+            for seed in seeds[:2]:
+                try:
+                    # A tight orientation tolerance here is what keeps the pinch point on target:
+                    # the wrist target was computed from the candidate tool pose, so an orientation
+                    # that lands 0.05 rad off moves the fingers 7 mm.
+                    joints = self.solve(arm, wrist, tool, q_init=seed, iterations=80,
+                                        orientation_tolerance=0.02)
+                except IkError as exc:
+                    failures.append(str(exc))
+                    continue
+                return joints, float(quat_angle_between(self.fk(arm, joints)["q"], orientation))
+        detail = (failures or strict_errors)[-1]
         raise IkError(f"{arm} arm cannot reach {[round(v, 3) for v in position]} in a usable tool "
                       f"orientation: {detail}")
 
@@ -264,7 +282,33 @@ def _quat_from_matrix(m: np.ndarray) -> list[float]:
     return [float(v) for v in _qf(np.asarray(m, dtype=float))]
 
 
-def _angle_between(a: list[float], b: list[float]) -> float:
-    """Angle between two orientations, in radians (0 when identical)."""
-    dot = abs(float(np.dot(np.asarray(a, dtype=float), np.asarray(b, dtype=float))))
-    return 2.0 * float(np.arccos(min(1.0, dot)))
+def _along(orientation: list[float], point: list[float], sign: float) -> list[float]:
+    """``point`` moved ``sign`` times the tool offset along the orientation's +z axis.
+
+    The pinch point is ``TCP_OFFSET`` along the end-effector's +z, so a tool pose and its pinch
+    point are exchanged by this one displacement with ``sign`` +1 or -1.
+    """
+    from steward.math3d import quat_rotate
+
+    reach = quat_rotate(orientation, TCP_OFFSET)
+    return [float(p) + sign * float(r) for p, r in zip(point, reach, strict=True)]
+
+
+def _turn_and_tilt(orientation: list[float], turn: float, tilt: float, azimuth: float) -> list[float]:
+    """``orientation`` with the tool turned about its own axis and then tilted off it."""
+    from steward.math3d import quat_from_axis_angle, quat_mul
+
+    tool = quat_mul(orientation, quat_from_axis_angle([0.0, 0.0, 1.0], turn))
+    if tilt == 0.0:
+        return [float(v) for v in tool]
+    axis = [math.cos(azimuth), math.sin(azimuth), 0.0]
+    return [float(v) for v in quat_mul(tool, quat_from_axis_angle(axis, tilt))]
+
+
+def _tool_candidates(max_tilt: float):
+    """(turn, tilt, azimuth) tool poses to try, cheapest and most upright first."""
+    for turn in _TURNS:
+        yield turn, 0.0, 0.0
+    for fraction in _TILT_FRACTIONS:
+        for i in range(_TILT_AZIMUTHS):
+            yield 0.0, max_tilt * fraction, 2.0 * math.pi * i / _TILT_AZIMUTHS

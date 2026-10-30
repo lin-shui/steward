@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from steward.assets.cobot import TCP_OFFSET
+from steward.assets.cobot import HOME, TCP_OFFSET
 from steward.ego.ik import CobotIK, IkError
 from steward.math3d import pose_compose, quat_from_axis_angle
 
@@ -47,6 +47,7 @@ class MotionConfig:
     retreat_height: float = 0.15   # lift after closing the fingers
     line_step: float = 0.04        # straight-line descents and lifts are walked in these increments
     max_tool_tilt: float = 0.7     # rad the tool may tilt off the requested orientation (wrist limits)
+    tcp_tolerance: float = 0.015   # a solved pose further than this from the pinch point is refused
     grasp_grip_wait_s: float = 0.4
 
 
@@ -123,6 +124,8 @@ class CobotSkills:
                 self.place(job, plan)
             elif skill == "push":
                 self.push(job, plan)
+            elif skill == "park":
+                self.park(job, plan)
             elif skill in ("open", "close"):
                 self.gripper(job, plan.get("gripper") or plan.get("grip"), close=(skill == "close"))
             else:
@@ -252,6 +255,13 @@ class CobotSkills:
                 # accepted rather than declaring a reachable place unreachable.
                 joints, tilt = self.ik.solve_tool(arm, target["p"], target["q"],
                                                   max_tilt=self.config.max_tool_tilt, q_init=seed)
+                # Report the pinch point, not the wrist: a tilted tool that keeps its wrist on
+                # target is exactly how a descent ends up a few centimetres off the plate.
+                reached = self._tcp_of(self.ik.fk(arm, joints))
+                missed = sum((a - b) ** 2 for a, b in zip(reached, tcp, strict=True)) ** 0.5
+                if missed > self.config.tcp_tolerance:
+                    raise SkillFailed(f"{arm} tool would land {missed * 100:.1f} cm from {_fmt(tcp)} "
+                                      f"at {_fmt(reached)} (tilt {tilt:.2f} rad)")
                 if tilt > 0.02:
                     job.log.append(f"{arm} tool tilted {tilt:.2f} rad to reach {_fmt(tcp)}")
         except IkError as exc:
@@ -261,13 +271,25 @@ class CobotSkills:
         job.log.append(f"{arm} at {_fmt(self.tcp(arm))}")
 
     def move_pose(self, job: Job, plan: dict) -> None:
-        """Put the arm's pinch point at ``plan['at']`` (with an optional wxyz ``orientation``)."""
+        """Put the arm's pinch point at ``plan['at']`` (with an optional wxyz ``orientation``).
+
+        Without an explicit orientation the tool points down, which is what makes "the pinch point
+        is at ``plan['at']``" true: a position-only solve may satisfy the wrist anywhere it likes."""
         arm = self._arm(plan)
         at = _xyz(plan["at"], "plan.at")
         orientation = plan.get("orientation")
         if orientation is not None and len(orientation) != 4:
             raise SkillFailed(f"plan.orientation must be a wxyz quaternion, got {orientation!r}")
-        self.move_to(job, arm, at, orientation, line=bool(plan.get("line", False)))
+        self.move_to(job, arm, at, orientation or _tool_down(), line=bool(plan.get("line", False)))
+
+    def park(self, job: Job, plan: dict) -> None:
+        """Return one arm to the twin's rest posture, out of the overhead camera's view.
+
+        A mission that gives up while holding something over the table leaves its own forearm in
+        the camera; parking is a verb because "look again" needs a clear view first."""
+        arm = self._arm(plan)
+        self.move_joints(job, {"arm": arm,
+                               "joints": dict(zip(self.ik.joint_names(arm), HOME, strict=True))})
 
     def move_joints(self, job: Job, plan: dict) -> None:
         """Drive one arm's six joints to the requested posture."""

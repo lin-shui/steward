@@ -117,3 +117,15 @@ def test_joint_target_outside_the_urdf_range_is_refused(rig) -> None:
     done = skills.wait(job.id, timeout=30)
     assert done.state == "failed"
     assert "outside" in done.message
+
+
+def test_park_verb_returns_the_arm_to_the_rest_posture(rig) -> None:
+    from steward.assets.cobot import HOME
+
+    sim, skills = rig
+    job = skills.start("park", {"id": "r6", "plan": {"arm": "L"}})
+    done = skills.wait(job.id, timeout=90)
+    assert done.state == "succeeded", f"{done.message}\n" + "\n".join(done.log)
+    joints = sim.sensors("w:cobot")["joints"]
+    for name, value in zip(skills.ik.joint_names("L"), HOME, strict=True):
+        assert joints[name] == pytest.approx(value, abs=0.06)

@@ -409,5 +409,8 @@ def build_cobot_workstation(service: AuthoringService) -> dict:
         "scene": "cobot-table",
         "robots": ["w:cobot-1"],
         "task": COBOT_TASK,
+        # Frame the console on the workstation: both arms and both pieces of tableware fill the
+        # view, which is the only way a three-centimetre grasp is visible on the Ego-State panel.
+        "view": {"lookat": [0.30, 0.14, 0.80], "distance": 1.9, "azimuth": 90.0, "elevation": -35.0},
     })
     return {"assets": {k: v["version"][:12] for k, v in published.items()}, "scene": scene, "scenario": scenario}

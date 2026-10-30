@@ -66,3 +66,42 @@ def test_bad_arguments_are_rejected(ik: CobotIK) -> None:
         ik.fk("X")
     with pytest.raises(ValueError):
         ik.solve("L", [0.3, 0.2, 0.6], q_init=[0.0, 0.0])
+
+
+def _wrist_for(pinch: list[float], tool: list[float]) -> tuple[list[float], list[float]]:
+    from steward.assets.cobot import TCP_OFFSET
+    from steward.math3d import pose_compose, pose_inverse
+
+    wrist = pose_compose({"p": pinch, "q": tool},
+                         pose_inverse({"p": TCP_OFFSET, "q": [1.0, 0.0, 0.0, 0.0]}))
+    return wrist["p"], wrist["q"]
+
+
+def _pinch_of(ik: CobotIK, arm: str, joints: list[float]) -> list[float]:
+    from steward.assets.cobot import TCP_OFFSET
+    from steward.math3d import pose_compose
+
+    return pose_compose(ik.fk(arm, joints), {"p": TCP_OFFSET, "q": [1.0, 0.0, 0.0, 0.0]})["p"]
+
+
+def test_tilted_tool_keeps_the_pinch_point_where_it_was_asked(ik: CobotIK) -> None:
+    """A tilted tool must move the wrist, not the fingers.
+
+    This is the far corner of the plate where the vertical tool runs into the wrist's roll limit:
+    the solver has to tilt, and before it compensated, the fingers landed ~5 cm away from the
+    target while every report still read "at the target" -- a place that missed.
+    """
+    pinch = [0.302, 0.101, 0.942]
+    wrist, tool = _wrist_for(pinch, [0.0, 1.0, 0.0, 0.0])  # tool pointing down
+    joints, tilt = ik.solve_tool("L", wrist, tool, max_tilt=0.7, q_init=ik.neutral("L"))
+    assert tilt > 0.0, "this pose is expected to need a tilt (otherwise the case is not exercised)"
+    reached = _pinch_of(ik, "L", joints)
+    assert np.linalg.norm(np.subtract(reached, pinch)) < 0.015, f"pinch landed at {reached}"
+
+
+def test_solve_tool_does_not_tilt_when_the_exact_orientation_works(ik: CobotIK) -> None:
+    pinch = [0.30, 0.20, 0.80]
+    wrist, tool = _wrist_for(pinch, [0.0, 1.0, 0.0, 0.0])
+    joints, tilt = ik.solve_tool("L", wrist, tool, max_tilt=0.7, q_init=ik.neutral("L"))
+    assert tilt == 0.0
+    assert np.linalg.norm(np.subtract(_pinch_of(ik, "L", joints), pinch)) < 5e-3

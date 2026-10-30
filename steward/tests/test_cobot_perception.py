@@ -89,3 +89,38 @@ def test_single_camera_robot_still_uses_the_first_sensor(rig) -> None:
 
     forward = quat_rotate(pose["q"], [1.0, 0.0, 0.0])
     assert forward[2] == pytest.approx(-np.sin(np.radians(30)), abs=1e-6)
+
+
+def test_the_ego_scene_uses_the_joints_it_is_given(rig) -> None:
+    """The console's Ego State must show the arm where the encoders say it is.
+
+    The mission looks at the table a few times a round; between looks the estimator holds the
+    joints of the last frame, so a panel built from them alone freezes for the whole motion.
+    """
+    sim, est = rig
+    _sync(est, sim)
+    frame = sim.proprioception("w:cobot")
+    moved = {name: value + 0.1 for name, value in frame["joints"].items()}
+    frame["joints"] = moved
+    scene = est.to_scene(frame)
+    robot = next(ent for ent in scene.entities if ent.role == "robot")
+    shown = {joint.id: joint.q.value[0] for joint in robot.body.joints if joint.q and joint.q.value}
+    assert shown["L_joint1"] == pytest.approx(moved["L_joint1"])
+    assert shown["L_joint1"] != pytest.approx(est.joints["L_joint1"])
+    # without a live frame the same scene describes what the estimator itself last saw
+    stale = {joint.id: joint.q.value[0] for joint in est.to_scene().entities[0].body.joints
+             if joint.q and joint.q.value}
+    assert stale["L_joint1"] == pytest.approx(est.joints["L_joint1"])
+
+
+def test_proprioception_leaves_the_perception_noise_stream_alone(rig) -> None:
+    """A console watching the twin must not change what the twin perceives."""
+    import copy
+
+    sim, _ = rig
+    before = copy.deepcopy(sim.rng.bit_generator.state)
+    baseline = sim.sensors("w:cobot")["odometry"]
+    sim.rng.bit_generator.state = before
+    for _ in range(5):
+        sim.proprioception("w:cobot")
+    assert sim.sensors("w:cobot")["odometry"] == baseline

@@ -79,11 +79,11 @@ def test_a_failed_grasp_is_reported_not_raised(rig) -> None:
         log: list = []
 
     class _Stub:
-        """A body whose grasp always misses, and which can still let go."""
+        """A body whose grasp always misses, and which can still let go and park."""
 
         def start(self, name, receipt):
             job = _Job()
-            if name == "open":
+            if name in ("open", "park"):
                 job.state = "succeeded"
             return job
 

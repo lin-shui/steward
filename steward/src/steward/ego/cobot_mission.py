@@ -18,7 +18,7 @@ from typing import Callable
 
 import numpy as np
 
-from steward.ego.cobot_skills import CobotSkills, SkillFailed, SkillStopped
+from steward.ego.cobot_skills import ARM_OF_GRIPPER, CobotSkills, SkillFailed, SkillStopped
 from steward.ego.estimator import EgoEstimator
 
 
@@ -37,10 +37,16 @@ def perceive(est: EgoEstimator, frame: Callable[[], dict], frames: int = 8,
              rgbd: bool = False) -> dict[str, Sighting]:
     """Update the estimator ``frames`` times and report the best track per category.
 
+    A track counts only if these frames saw it. Existence decays slowly, so an object that an arm
+    carried out of view and set down elsewhere is still alive in the belief for many frames — and
+    reporting its last position sends the next grasp to where it used to be, which closes on
+    nothing while the log says the fingers are exactly on it.
+
     ``rgbd=True`` means ``frame()`` returns a decoded RGB-D frame (rgb, depth, anonymous masks,
     header) instead of labelled detections: the robot then has to find and measure the objects
     itself, which is the whole point of the exercise.
     """
+    before = {track_id: track.last_seen for track_id, track in est.tracks.items()}
     for _ in range(frames):
         payload = frame()
         if rgbd:
@@ -52,6 +58,8 @@ def perceive(est: EgoEstimator, frame: Callable[[], dict], frames: int = 8,
     best: dict[str, Sighting] = {}
     for track in est.tracks.values():
         if not track.category_counts or track.existence < min_existence:
+            continue
+        if before.get(track.id) == track.last_seen:
             continue
         category = max(track.category_counts, key=track.category_counts.get)
         cam = est.camera_pose()
@@ -107,9 +115,24 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
                 # gripper can only fail, and leaving it held hides the failure from the operator.
                 _run(skills, "open", {"gripper": grip}, log)
                 log.append(f"attempt {attempt}: put the load down where it was held")
+            _park(skills, grip, log)
             continue
         return {"ok": True, "attempts": attempt, "bowl": bowl.pos.tolist(), "plate": plate.pos.tolist(), "log": log}
     return {"ok": False, "log": log}
+
+
+def _park(skills: CobotSkills, grip: str, log: list[str]) -> None:
+    """Take the arm out of the overhead camera's way before the next look.
+
+    A failed attempt leaves the hand where it gave up — typically over the plate it was lowering
+    onto — so the camera sees a forearm instead of the tabletop. Parking first is what makes the
+    retry's look a real one rather than a decision on a stale belief.
+    """
+    arm = ARM_OF_GRIPPER.get(grip, "L")
+    try:
+        _run(skills, "park", {"arm": arm}, log)
+    except SkillFailed as exc:
+        log.append(f"park failed: {exc}")
 
 
 def _run(skills: CobotSkills, name: str, plan: dict, log: list[str]) -> None:

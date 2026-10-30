@@ -770,6 +770,30 @@ class WorldSim:
                 frame["detections"] = self._detections(robot_id, cam_pose, sensor)
             return frame
 
+    def proprioception(self, robot_id: str) -> dict:
+        """The robot's own joint encoders and gripper states, with no exteroceptive fields.
+
+        This is what the Ego-State view's self part is built from, so it deliberately does not
+        touch the perception noise stream: a console watching the robot must not change what the
+        robot believes. ``gripper`` summarises both grippers of a dual-arm robot -- ``grippers``
+        carries them per link for anything that needs to tell the arms apart."""
+        with self.lock:
+            rs = self._robot(robot_id)
+            names = self.build.names[robot_id]
+            joints = {jid: self._joint_q(jname) for jid, jname in names.joints.items()}
+            grips = {lid: {"state": "closed" if g.closed else "open",
+                           "holding": g.attached is not None or g.handle is not None,
+                           "holdingHandle": g.handle is not None}
+                     for lid, g in rs.grippers.items()}
+            frame = {"stamp": self.time, "joints": joints, "grippers": grips}
+            if len(grips) == 1:
+                frame["gripper"] = next(iter(grips.values()))
+            else:
+                frame["gripper"] = {"state": "closed" if any(g["state"] == "closed" for g in grips.values()) else "open",
+                                    "holding": any(g["holding"] for g in grips.values()),
+                                    "holdingHandle": any(g["holdingHandle"] for g in grips.values())}
+            return frame
+
     def perception_parts(self, ent) -> list[tuple[str, list[str] | None, str]]:
         """What a detector reports for one entity: ``(part id, links, category)``. Building walls and
         drawers are reported as separate parts; everything else as the whole entity."""

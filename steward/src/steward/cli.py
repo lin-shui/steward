@@ -295,8 +295,9 @@ def cmd_cobot(args) -> int:
     est = EgoEstimator(robot_model=cobot_magic().to_dict())
     rgbd = phase_modules(args.phase)["perception"] == "rgbd"
     # The console's Ego State panel is rendered from the mission's own estimator, so the operator
-    # watches the belief the skills are acting on -- not a second, independent one.
-    ego = cobot_ego_api(est, port=0)
+    # watches the belief the skills are acting on -- not a second, independent one. Its self part
+    # reads the twin's encoders on every frame, so the arm on that panel moves with the arm.
+    ego = cobot_ego_api(est, port=0, live=lambda: sim.proprioception(robot_id))
     host.attach_ego_api(robot_id, ego.url)
 
     def sensed_frame() -> dict:

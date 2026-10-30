@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import threading
+from typing import Callable
 
 from steward.ego.estimator import EgoEstimator
 from steward.ego.view import EgoViewRenderer
@@ -22,17 +23,28 @@ from steward.viewloop import ViewLoop, ViewSettings, frame_response
 
 
 class CobotEgoView:
-    """Publishes one estimator's belief over HTTP for the console."""
+    """Publishes one estimator's belief over HTTP for the console.
 
-    def __init__(self, estimator: EgoEstimator) -> None:
+    ``live`` supplies the robot's current sensor frame. The mission looks at the table a few times
+    per round, so without it the panel would show the arm frozen where the last look left it --
+    while the arm is in fact mid-motion. Proprioception is continuous; only exteroception is
+    look-by-look.
+    """
+
+    def __init__(self, estimator: EgoEstimator, live: Callable[[], dict] | None = None) -> None:
         self.estimator = estimator
+        self.live = live
         self._lock = threading.Lock()
         renderer = EgoViewRenderer()
         self.view = ViewLoop("ego", lambda settings: self._render(renderer, settings), renderer.close).start()
 
-    def _render(self, renderer: EgoViewRenderer, settings: ViewSettings):
+    def _scene(self):
+        frame = None if self.live is None else self.live()
         with self._lock:
-            scene = self.estimator.to_scene().to_dict()
+            return self.estimator.to_scene(frame)
+
+    def _render(self, renderer: EgoViewRenderer, settings: ViewSettings):
+        scene = self._scene().to_dict()
         return renderer.render(scene, settings), "image/jpeg", {"stamp": self.estimator.stamp}
 
     # ------------------------------------------------------------------ routes
@@ -53,14 +65,14 @@ class CobotEgoView:
             ("POST", "/ego/view"): lambda q, b: self.view.configure(ViewSettings.parse(b)),
             ("GET", "/ego/view/frame"): view_frame,
             ("GET", "/ego/summary"): lambda q, b: self.summary(),
-            ("GET", "/ego/state"): lambda q, b: self.estimator.to_scene().to_dict(),
+            ("GET", "/ego/state"): lambda q, b: self._scene().to_dict(),
             ("GET", "/ego/alerts"): lambda q, b: {"alerts": []},
         }
 
     def summary(self) -> dict:
         """The object list behind the Ego State view, in the shape the console already reads."""
         with self._lock:
-            scene = self.estimator.to_scene()
+            scene = self.estimator.to_scene(None if self.live is None else self.live())
             stamp = self.estimator.stamp
             held = self.estimator.held_id
         objects = []
@@ -87,9 +99,10 @@ class CobotEgoView:
         self.view.stop()
 
 
-def cobot_ego_api(estimator: EgoEstimator, port: int = 0, bind_wait_s: float = 0.0) -> JsonServer:
+def cobot_ego_api(estimator: EgoEstimator, port: int = 0, bind_wait_s: float = 0.0,
+                  live: Callable[[], dict] | None = None) -> JsonServer:
     """Serve one estimator's belief on ``port`` (0 picks a free one)."""
-    view = CobotEgoView(estimator)
+    view = CobotEgoView(estimator, live=live)
     server = JsonServer(view.routes(), port=port, name="ego", bind_wait_s=bind_wait_s)
     server.start()
 
