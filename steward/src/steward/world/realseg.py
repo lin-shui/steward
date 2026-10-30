@@ -36,7 +36,8 @@ LAYER_M = 0.05  # depth bin for foreground proposals
 PROTRUSION_M = 0.06  # how much nearer than its surrounding ring a foreground region must be
 MAX_BOXES = 8
 MIN_PIXELS = 25  # matches the synthetic channel's smallest instance
-NEAR_RANGE_M = 0.30  # closer than this an instance is the robot's own gripper or arm
+NEAR_RANGE_M = 0.30  # closer than this nothing is a reachable object, whatever the segmenter says
+SELF_SHARE = 0.5  # share of an instance's pixels inside the robot's own projected silhouette
 GROUND_Z_M = 0.06  # world height under which a large flat instance is the floor
 GROUND_SHARE = 0.05  # floor candidates must also cover this share of the image
 PLANE_SLAB_M = 0.06  # half-thickness of the world-z slab a surface's points concentrate in
@@ -86,6 +87,8 @@ class RealSegmenter:
         self._served = -1.0  # stamp already handed out (long-poll dedupe)
         self._failures = 0
         self._thread: threading.Thread | None = None
+        self._estimator = None  # built on first frame: the robot's kinematic self-model
+        self._camera_id: str | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -818,6 +821,7 @@ class RealSegmenter:
         kept = 0
         ids = rng_shuffle.permutation(np.arange(1, 256))[: len(instances)]
         slivers = self._slivers(labels, instances, depth_mm, fovy, cam_pose)
+        self_px = self._self_mask(labels.shape, cam_pose)
         for info, new_id in zip(instances, ids, strict=False):
             inst = int(info["id"])
             if inst in slivers:
@@ -829,8 +833,10 @@ class RealSegmenter:
             valid = (dd > 0.05) & (dd < 6.0)
             if int(valid.sum()) < MIN_PIXELS:
                 continue
+            if self_px is not None and float(self_px[ys, xs].mean()) > SELF_SHARE:
+                continue  # the robot's own arm or gripper, projected from its kinematics
             if float(np.median(dd[valid])) < NEAR_RANGE_M:
-                continue  # the robot's own gripper or arm
+                continue  # something pressed against the lens: not a reachable object
             cam = np.stack([dd[valid],
                             -(xs[valid] - cx) * dd[valid] / f,
                             -(ys[valid] - cy) * dd[valid] / f], axis=1)
@@ -841,3 +847,27 @@ class RealSegmenter:
             out[ys, xs] = int(new_id)
             kept += 1
         return out
+
+    def _self_mask(self, shape: tuple[int, int], cam_pose: dict) -> np.ndarray | None:
+        """Pixels the robot's own body occupies, from its kinematics; None when unavailable.
+
+        The synthetic channel got this for free (the renderer excludes the observing robot); a
+        real segmenter has no idea what the robot looks like, so the robot projects itself."""
+        try:
+            from steward.ego.estimator import EgoEstimator
+            from steward.ego.selfmask import self_pixels
+
+            if self._estimator is None:
+                entity = self._sim.template.entity(self._robot)
+                self._estimator = EgoEstimator(robot_model=entity.to_dict())
+                self._camera_id = next(
+                    sensor["id"] for link in entity.rigid.links for sensor in link.sensors
+                    if sensor.get("kind") in ("rgb", "depth", "rgbd"))
+            frame = self._sim.sensors(self._robot)
+            self._estimator.joints = frame["joints"]
+            self._estimator.odometry = frame["odometry"]
+            _, sensor = self._sim.camera_pose(self._robot, self._camera_id)
+            return self_pixels(self._estimator.robot_model, self._estimator.link_pose,
+                               cam_pose, sensor["intrinsics"])
+        except Exception:  # noqa: BLE001 - a missing self mask must not stop perception
+            return None
