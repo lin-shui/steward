@@ -153,7 +153,8 @@ class EgoEstimator:
         self.stamp = float(frame["stamp"])
         self.odometry = frame["odometry"]
         self.joints = frame["joints"]
-        self.gripper = frame["gripper"]
+        # single-gripper robots report "gripper"; multi-gripper frames carry "grippers" per link
+        self.gripper = frame.get("gripper") or {"state": "open", "holding": False, "holdingHandle": False}
         if not self.gripper.get("holding"):
             self._clear_held()
         # A held object moves with this frame's body pose; update it before association so a
@@ -188,7 +189,7 @@ class EgoEstimator:
         self.stamp = float(header["stamp"])
         self.odometry = header["odometry"]
         self.joints = header["joints"]
-        self.gripper = header["gripper"]
+        self.gripper = header.get("gripper") or {"state": "open", "holding": False, "holdingHandle": False}
         if not self.gripper.get("holding"):
             self._clear_held()
         self._follow_held()
