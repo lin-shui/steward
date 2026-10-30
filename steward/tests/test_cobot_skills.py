@@ -11,8 +11,8 @@ from steward.world.sim import WorldSim
 # The left arm's comfortable tabletop band, measured by scanning tool-down IK against the URDF:
 # grasp points are reachable with a strictly vertical tool at x <= ~0.30, y >= ~0.15.
 TABLE_TOP = 0.75
-BOWL_AT = [0.28, 0.25, TABLE_TOP]
-PLATE_AT = [0.30, 0.02, TABLE_TOP]
+BOWL_AT = [0.28, 0.32, TABLE_TOP]
+PLATE_AT = [0.30, 0.10, TABLE_TOP]  # inside the reachable band the wrist can hold vertically
 
 
 def _scene() -> dict:
@@ -88,9 +88,12 @@ def test_pick_and_place_moves_the_object(rig) -> None:
 
 def test_pick_where_there_is_nothing_reports_a_failed_grasp(rig) -> None:
     sim, skills = rig
-    # Table top, midway between the bowl (y 0.25) and the plate (y 0.02): reachable with a vertical
-    # tool, and both are farther than the 6 cm capture radius.
-    job = skills.start("pick", {"id": "r3", "plan": {"arm": "L", "at": [0.28, 0.15, TABLE_TOP]}})
+    # Table top, midway between the bowl and the plate: reachable with a vertical tool, and both
+    # are farther than the 6 cm capture radius (computed, so a layout change cannot invalidate it).
+    empty = [(BOWL_AT[0] + PLATE_AT[0]) / 2, (BOWL_AT[1] + PLATE_AT[1]) / 2, TABLE_TOP]
+    assert min(np.hypot(empty[0] - BOWL_AT[0], empty[1] - BOWL_AT[1]),
+               np.hypot(empty[0] - PLATE_AT[0], empty[1] - PLATE_AT[1])) > 0.07
+    job = skills.start("pick", {"id": "r3", "plan": {"arm": "L", "at": empty}})
     done = skills.wait(job.id, timeout=90)
     assert done.state == "failed"
     assert "grabbed nothing" in done.message

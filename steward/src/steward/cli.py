@@ -246,6 +246,8 @@ def cmd_cobot(args) -> int:
     from steward.ego.cobot_mission import bowl_onto_plate
     from steward.ego.cobot_skills import CobotSkills
     from steward.ego.estimator import EgoEstimator
+    from steward.ego.perception import decode_rgbd
+    from steward.phases import phase_modules
 
     if "cobot-table" not in AuthoringService(args.root).list_scenarios():
         build_cobot_workstation(AuthoringService(args.root))
@@ -255,9 +257,15 @@ def cmd_cobot(args) -> int:
     robot_id = host.scenario["robots"][0]
     skills = CobotSkills(command=lambda cmd: sim.command(robot_id, cmd), state=lambda: sim.sensors(robot_id))
     est = EgoEstimator(robot_model=cobot_magic().to_dict())
+    rgbd = phase_modules(args.phase)["perception"] == "rgbd"
+
+    def sensed_frame() -> dict:
+        return decode_rgbd(sim.rgbd(robot_id, camera="top_camera")) if rgbd else sim.sensors(robot_id)
+
     print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
                       "robot": host.robot_servers[robot_id].url, "task": host.scenario["task"],
-                      "perception": "ground-truth" if args.ground_truth else "estimated",
+                      "phase": args.phase,
+                      "perception": "ground-truth" if args.ground_truth else ("rgbd" if rgbd else "detections"),
                       "runDir": str(run_dir)}, ensure_ascii=False), flush=True)
 
     outcome: dict = {}
@@ -285,7 +293,7 @@ def cmd_cobot(args) -> int:
 
     def run_sensed_mission() -> None:
         try:
-            result = bowl_onto_plate(est, skills, lambda: sim.sensors(robot_id))
+            result = bowl_onto_plate(est, skills, sensed_frame, rgbd=rgbd)
             outcome.update(result)
             print(json.dumps({"mission": "bowl-on-plate", **result}, ensure_ascii=False), flush=True)
         except Exception as exc:  # noqa: BLE001 - reported to the operator, console stays up
@@ -502,8 +510,7 @@ def main(argv: list[str] | None = None) -> int:
         in_process = name in ("demo", "shuttle", "chores", "cobot")
         p.add_argument("--speed", type=float, default=4.0 if in_process else 1.0)
         p.add_argument("--seed", type=int, default=0)
-        p.add_argument("--phase", choices=sorted(PHASES),
-                       default="phase0" if name == "cobot" else LATEST_PHASE,
+        p.add_argument("--phase", choices=sorted(PHASES), default=LATEST_PHASE,
                        help="phase level of the replaceable modules (switchable at run time from the console)")
         p.add_argument("--wca-port", type=int, default=0 if in_process else 7400)
         p.add_argument("--robot-port", type=int, default=0 if in_process else 7410)

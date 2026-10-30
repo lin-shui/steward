@@ -339,8 +339,8 @@ def cobot_spec() -> dict:
             {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
             # Table centre is (0.45, 0); these land the tableware in the left arm's reachable band,
             # where a strictly vertical tool can still descend (see tests/test_cobot_skills.py).
-            {"id": "w:bowl-1", "asset": "bowl", "on": "w:table-1", "offset": [-0.17, 0.25]},
-            {"id": "w:plate-1", "asset": "plate", "on": "w:table-1", "offset": [-0.15, 0.02]},
+            {"id": "w:bowl-1", "asset": "bowl", "on": "w:table-1", "offset": [-0.17, 0.32]},
+            {"id": "w:plate-1", "asset": "plate", "on": "w:table-1", "offset": [-0.15, 0.10]},
         ],
         "regions": [{"id": "workcell", "label": "workcell", "polygon": [[-2, -2], [2, -2], [2, 2], [-2, 2]]}],
     }

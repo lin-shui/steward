@@ -144,6 +144,27 @@ class CobotSkills:
                 self._on_finish(job)
 
     # ------------------------------------------------------------------- verbs
+    def _move_above(self, job: Job, arm: str, at: list[float], tool: list[float]) -> list[float]:
+        """Reach a pre-grasp pose above ``at``, lowering the approach until the wrist can hold it.
+
+        A pre-grasp pose is the highest point of the motion, and the far side of the table sits at
+        the wrist's limit: an unreachable approach must be lowered, not treated as an unreachable
+        object. Nothing has moved when the IK refuses, so retrying lower is safe.
+        """
+        last: SkillFailed | None = None
+        for height in (self.config.approach_height, self.config.approach_height * 0.75,
+                       self.config.approach_height * 0.5, 0.03):
+            point = [at[0], at[1], at[2] + height]
+            try:
+                self.move_to(job, arm, point, tool)
+            except SkillFailed as exc:
+                last = exc
+                continue
+            if height < self.config.approach_height:
+                job.log.append(f"{arm} approach lowered to {height:.2f} m above the target")
+            return point
+        raise last if last is not None else SkillFailed(f"{arm} arm cannot reach above {_fmt(at)}")
+
     def pick(self, job: Job, plan: dict) -> None:
         """Reach the pinch point over ``plan['at']``, descend, close, and lift clear."""
         arm = self._arm(plan)
@@ -152,9 +173,8 @@ class CobotSkills:
         tool = _tool_down()
         if (self._state().get("grippers") or {}).get(grip, {}).get("state") != "open":
             self.gripper(job, grip, close=False)
-        above = [at[0], at[1], at[2] + self.config.approach_height]
+        above = self._move_above(job, arm, at, tool)
         job.log.append(f"{arm} approach above {_fmt(above)}")
-        self.move_to(job, arm, above, tool)
         self.move_to(job, arm, at, tool, line=True)
         self.gripper(job, grip, close=True)
         lifted = [at[0], at[1], at[2] + self.config.retreat_height]
@@ -171,9 +191,16 @@ class CobotSkills:
         at = _xyz(plan["at"], "plan.at")
         grip = plan.get("gripper", f"{arm}_link6")
         tool = _tool_down()
-        above = [at[0], at[1], at[2] + self.config.approach_height]
+        try:
+            above = self._move_above(job, arm, at, tool)
+        except SkillFailed:
+            # Already holding the load at table height: cross over at the height it is carried and
+            # come straight down, which is what a person does and what the reach limit allows.
+            here = self.tcp(arm)
+            above = [at[0], at[1], max(here[2], at[2] + 0.03)]
+            self.move_to(job, arm, above, tool)
+            job.log.append(f"{arm} approach at carry height {above[2]:.3f}")
         job.log.append(f"{arm} carry to {_fmt(above)}")
-        self.move_to(job, arm, above, tool)
         self.move_to(job, arm, at, tool, line=True)
         self.gripper(job, grip, close=False)
         self.move_to(job, arm, [at[0], at[1], at[2] + self.config.retreat_height], tool, line=True)

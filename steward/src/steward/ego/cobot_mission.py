@@ -33,10 +33,20 @@ class Sighting:
 
 
 def perceive(est: EgoEstimator, frame: Callable[[], dict], frames: int = 8,
-             pause_s: float = 0.02, min_existence: float = 0.4) -> dict[str, Sighting]:
-    """Update the estimator ``frames`` times and report the best track per category."""
+             pause_s: float = 0.02, min_existence: float = 0.4,
+             rgbd: bool = False) -> dict[str, Sighting]:
+    """Update the estimator ``frames`` times and report the best track per category.
+
+    ``rgbd=True`` means ``frame()`` returns a decoded RGB-D frame (rgb, depth, anonymous masks,
+    header) instead of labelled detections: the robot then has to find and measure the objects
+    itself, which is the whole point of the exercise.
+    """
     for _ in range(frames):
-        est.update(frame())
+        payload = frame()
+        if rgbd:
+            est.update_rgbd(payload)
+        else:
+            est.update(payload)
         if pause_s:
             time.sleep(pause_s)
     best: dict[str, Sighting] = {}
@@ -60,7 +70,7 @@ def sighting_distance(pos, cam_pose: dict) -> np.ndarray:
 
 
 def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], dict],
-                    grip: str = "L_link6", retries: int = 2) -> dict:
+                    grip: str = "L_link6", retries: int = 2, rgbd: bool = False) -> dict:
     """Look at the table, pick up the bowl where the robot believes it is, and set it on the plate.
 
     A missed grasp is fed back: the robot looks again before the next attempt, so a stale or wrong
@@ -68,7 +78,7 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
     """
     log: list[str] = []
     for attempt in range(1, retries + 1):
-        seen = perceive(est, frame)
+        seen = perceive(est, frame, rgbd=rgbd, frames=10 if rgbd else 8)
         missing = [c for c in ("bowl", "plate") if c not in seen]
         if missing:
             log.append(f"attempt {attempt}: not seen: {', '.join(missing)}")
@@ -87,6 +97,12 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
             raise
         except SkillFailed as exc:
             log.append(f"attempt {attempt} failed: {exc}")
+            self_holding = (est.gripper or {}).get("holding") or self._holding(skills, grip)
+            if self_holding:
+                # Put the load down where it is: a retry that reaches for an object still in the
+                # gripper can only fail, and leaving it held hides the failure from the operator.
+                _run(skills, "open", {"grip": grip}, log)
+                log.append(f"attempt {attempt}: put the load down where it was held")
             continue
         return {"ok": True, "attempts": attempt, "bowl": bowl.pos.tolist(), "plate": plate.pos.tolist(), "log": log}
     return {"ok": False, "log": log}
@@ -104,6 +120,11 @@ def _run(skills: CobotSkills, name: str, plan: dict, log: list[str]) -> None:
 def _arm_can_reach(skills: CobotSkills, pos: np.ndarray) -> bool:
     """A crude gate before commanding: is this anywhere near the arm's measured workspace?"""
     return 0.10 <= float(pos[0]) <= 0.60 and 0.02 <= float(pos[1]) <= 0.55 and 0.55 <= float(pos[2]) <= 1.05
+
+
+def _holding(skills: CobotSkills, grip: str) -> bool:
+    st = skills._state()
+    return bool((st.get("grippers") or {}).get(grip, {}).get("holding"))
 
 
 def _fmt(p) -> str:

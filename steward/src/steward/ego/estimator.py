@@ -231,7 +231,7 @@ class EgoEstimator:
         # A held object moves with this frame's body pose; update it before association so a
         # turning robot does not see its own load as a new object.
         self._follow_held()
-        cam = self.camera_pose()
+        cam = self.camera_pose(self._frame_camera(frame))
         measurements = []
         for det in frame.get("detections", []):
             world = pose_compose(cam, det["pose"])
@@ -252,6 +252,16 @@ class EgoEstimator:
         self.version += 1
 
     # ------------------------------------------------------------- RGB-D path
+    @staticmethod
+    def _frame_camera(frame: dict, header: dict | None = None) -> str | None:
+        """The sensor a frame came from; a robot with several cameras reports it per frame."""
+        for source in (frame, header):
+            if isinstance(source, dict):
+                camera = source.get("camera")
+                if isinstance(camera, dict) and camera.get("id"):
+                    return str(camera["id"])
+        return None
+
     def update_rgbd(self, frame: dict) -> None:
         """Fuse one decoded RGB-D frame: segment it, measure every region, associate regions with
         tracks by position, size and category, and rebuild each matched track's box from the
@@ -264,7 +274,7 @@ class EgoEstimator:
         if not self.gripper.get("holding"):
             self._clear_held()
         self._follow_held()
-        cam = self.camera_pose()
+        cam = self.camera_pose(self._frame_camera(frame, header))
         cam_p = np.asarray(cam["p"])
         measurements = []
         for seg in segments(frame, cam, rng=self._rng):
