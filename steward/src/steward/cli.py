@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import signal
@@ -25,6 +26,12 @@ from steward.phases import LATEST_PHASE, PHASES
 
 STEWARD_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_ROOT = STEWARD_DIR / "var" / "steward"
+
+# The Cobot Magic twin keeps its own ports: the kitchen scenario owns 7400/7410, and two worlds
+# that fight over one port is the most confusing failure there is -- the console comes up, but it
+# is somebody else's world.
+COBOT_WCA_PORT = 7430
+COBOT_ROBOT_PORT = 7440
 
 
 def _robot_model() -> dict:
@@ -58,11 +65,37 @@ def cmd_build_kitchen(args) -> int:
 def _host(args, run_dir: Path):
     from steward.world.server import StewardHost
 
+    _require_free({"console (world)": getattr(args, "wca_port", 0),
+                   "robot": getattr(args, "robot_port", 0),
+                   "ego api": getattr(args, "api_port", 0)})
     ports = {"w:robot-1": args.robot_port} if getattr(args, "robot_port", 0) else {}
     return StewardHost(args.root, scenario=args.scenario, speed=args.speed, seed=args.seed, run_dir=run_dir,
                        wca_port=args.wca_port, robot_ports=ports, chat=_chat_config(args),
                        phase=args.phase, bind_wait_s=getattr(args, "bind_wait", 0.0),
                        pause_on_perception_fault=getattr(args, "pause_on_perception_fault", False)).start()
+
+
+def _require_free(ports: dict[str, int]) -> None:
+    """Fail before anything starts, naming the port, when another steward run still holds it.
+
+    Without this the bind error arrives as a bare "Address already in use" from a background
+    thread, and the confusing part is that a console does open -- it is just the other run's."""
+    import socket
+
+    for what, port in ports.items():
+        if not port:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                raise SystemExit(
+                    f"steward: the {what} port {port} is already in use.\n"
+                    f"  another steward run is probably still up; find it with\n"
+                    f"    lsof -nP -iTCP:{port} -sTCP:LISTEN\n"
+                    f"  then stop it, or pass a different port (--wca-port / --robot-port / --api-port).\n"
+                    f"  the kitchen scenario owns 7400/7410/7420; `steward cobot` owns "
+                    f"{COBOT_WCA_PORT}/{COBOT_ROBOT_PORT}") from None
 
 
 def _chat_config(args):
@@ -512,8 +545,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--phase", choices=sorted(PHASES), default=LATEST_PHASE,
                        help="phase level of the replaceable modules (switchable at run time from the console)")
-        p.add_argument("--wca-port", type=int, default=0 if in_process else 7400)
-        p.add_argument("--robot-port", type=int, default=0 if in_process else 7410)
+        p.add_argument("--wca-port", type=int, default=COBOT_WCA_PORT if name == "cobot" else (0 if in_process else 7400))
+        p.add_argument("--robot-port", type=int, default=COBOT_ROBOT_PORT if name == "cobot" else (0 if in_process else 7410))
         if not in_process:
             p.add_argument("--bind-wait", type=float, default=10.0,
                            help="seconds to wait for a fixed port still held by a service that just stopped")
@@ -550,7 +583,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="seconds to wait for a fixed port still held by a service that just stopped")
     p.set_defaults(fn=cmd_ego)
     args = parser.parse_args(argv)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        raise SystemExit(f"steward: a port is already in use ({exc}); stop the other run or pass "
+                         f"different --wca-port / --robot-port / --api-port values") from None
 
 
 if __name__ == "__main__":
