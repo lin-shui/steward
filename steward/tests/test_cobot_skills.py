@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from steward.assets.cobot import TCP_OFFSET, cobot_magic
-from steward.assets.generators import bowl, building, dining_table
+from steward.assets.generators import bowl, building, dining_table, plate
 from steward.ego.cobot_skills import CobotSkills, MotionConfig
 from steward.world.sim import WorldSim
 
@@ -12,6 +12,7 @@ from steward.world.sim import WorldSim
 # grasp points are reachable with a strictly vertical tool at x <= ~0.30, y >= ~0.15.
 TABLE_TOP = 0.75
 BOWL_AT = [0.28, 0.25, TABLE_TOP]
+PLATE_AT = [0.30, 0.02, TABLE_TOP]
 
 
 def _scene() -> dict:
@@ -28,7 +29,11 @@ def _scene() -> dict:
     dish = bowl().to_dict()
     dish["id"] = "w:bowl-1"
     dish["pose"]["value"]["p"] = list(BOWL_AT)
-    return {"mode": "world", "entities": [room, robot, table, dish]}
+
+    saucer = plate().to_dict()
+    saucer["id"] = "w:plate-1"
+    saucer["pose"]["value"]["p"] = list(PLATE_AT)
+    return {"mode": "world", "entities": [room, robot, table, dish, saucer]}
 
 
 @pytest.fixture()
@@ -83,7 +88,9 @@ def test_pick_and_place_moves_the_object(rig) -> None:
 
 def test_pick_where_there_is_nothing_reports_a_failed_grasp(rig) -> None:
     sim, skills = rig
-    job = skills.start("pick", {"id": "r3", "plan": {"arm": "L", "at": [0.30, 0.05, TABLE_TOP]}})
+    # Table top, midway between the bowl (y 0.25) and the plate (y 0.02): reachable with a vertical
+    # tool, and both are farther than the 6 cm capture radius.
+    job = skills.start("pick", {"id": "r3", "plan": {"arm": "L", "at": [0.28, 0.15, TABLE_TOP]}})
     done = skills.wait(job.id, timeout=90)
     assert done.state == "failed"
     assert "grabbed nothing" in done.message

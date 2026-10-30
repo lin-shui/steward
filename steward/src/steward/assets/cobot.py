@@ -172,13 +172,15 @@ def _piper_arm(prefix: str, mount_p: list[float], camera: bool = True,
 
 
 def cobot_magic(separation: float = 0.62, mount_height: float = 0.79,
-                top_camera_height: float = 1.15, top_camera_forward: float = 0.35,
-                camera_fovy: float = 60.0) -> Entity:
+                top_camera: list[float] | None = None, camera_fovy: float = 60.0) -> Entity:
     """Cobot Magic twin: fixed frame, two Piper arms, top + dual wrist RGB-D cameras.
 
-    ``separation``/``mount_height``/top-camera placement are MEASURE placeholders
-    (see module docstring); URDF-derived joint data is exact.
+    ``separation``/``mount_height``/``top_camera`` are MEASURE placeholders (see module
+    docstring); URDF-derived joint data is exact. Heights are measured from the floor, which is
+    where the frame link sits; the arms are mounted ``mount_height`` up and the overhead camera
+    looks straight down on the table from above the workcell.
     """
+    top_camera = list(top_camera) if top_camera is not None else [0.35, 0.10, 1.60]
     frame = Link(
         id="frame", name="cobot magic frame",
         # A slim back column rather than a full-depth box: the workspace in front of the arms is
@@ -189,8 +191,8 @@ def cobot_magic(separation: float = 0.62, mount_height: float = 0.79,
         inertial=exact({"mass": 40.0}),
         sensors=[{
             "id": "top_camera", "kind": "rgbd",
-            "mount": pose([top_camera_forward, 0.0, top_camera_height - mount_height],
-                          quat_from_axis_angle([0, 1, 0], math.pi / 2)),
+            # Straight down: the mount's +x (the optical axis) rotates onto world -z.
+            "mount": pose(top_camera, quat_from_axis_angle([0, 1, 0], math.pi / 2)),
             "intrinsics": {"width": 640, "height": 480, "fovy": camera_fovy}, "rateHz": 10,
         }],
     )

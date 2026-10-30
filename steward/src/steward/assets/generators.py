@@ -444,13 +444,5 @@ GENERATORS: dict[str, Callable[..., Entity]] = {
     "chair": chair,
     "steward_bot": steward_bot,
 }
-
-
-def _register_cobot() -> None:
-    """Register the agilex embodiment's generator without making every import pay for it."""
-    from steward.assets.cobot import cobot_magic
-
-    GENERATORS["cobot_magic"] = cobot_magic
-
-
-_register_cobot()
+# The agilex embodiment's generator lives in its own module (it imports these constants), so it is
+# registered by whoever needs it: see authoring.service.build_cobot_workstation.

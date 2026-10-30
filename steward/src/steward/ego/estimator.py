@@ -25,7 +25,8 @@ from steward.ego.classify import SHAPES, classify, prototype
 from steward.ego.perception import box_at_yaw, box_of, segments
 from steward.ego.planner import Box2D, front_box, protrusion, room_centre
 from steward.ego.priors import compatible, prior
-from steward.math3d import pose_compose, pose_inverse, quat_from_yaw, wrap_angle, yaw_from_quat
+from steward.math3d import (pose_compose, pose_inverse, quat_from_axis_angle, quat_from_yaw, quat_mul,
+                            quat_rotate, wrap_angle, yaw_from_quat)
 from steward.scene.schema import Entity, Est, Link, Relation, RigidTree, SceneState, primitive
 
 SELF_ID = "e:self"
@@ -114,7 +115,7 @@ class EgoEstimator:
         self.held_id: str | None = None
         self._rng = np.random.default_rng(0)
         self._self_template = self._make_self_template()
-        self._head_mount, self._camera = self._camera_model()
+        self._camera_link_id, self._camera = self._camera_model()
 
     # ------------------------------------------------------------- body model
     def _make_self_template(self) -> dict:
@@ -123,30 +124,100 @@ class EgoEstimator:
         data.pop("asset", None)
         return data
 
-    def _camera_model(self) -> tuple[dict, dict]:
+    def _camera_model(self) -> tuple[str, dict]:
+        """The robot's active camera: ``(link id, sensor)``; the link pose comes from the tree walk."""
         tree = self.robot_model["body"]
         for link in tree["links"]:
             for sensor in link.get("sensors", []):
                 if sensor["kind"] in ("rgb", "depth", "rgbd"):
-                    mount_joint = next(j for j in tree["joints"] if j["child"] == link["id"])
-                    return mount_joint["origin"]["value"], sensor
+                    return link["id"], sensor
         raise ValueError("robot model has no camera")
+
+    # ------------------------------------------------------- generic kinematics
+    def _tree(self) -> tuple[dict[str, list[tuple[dict, str]]], str]:
+        """The robot's joint graph: children[parent] = [(joint, child link)] and the root link.
+
+        Any link's pose is one walk from the root; that is what lets a wrist camera move with the
+        arm, instead of the fixed head-mount assumption the mobile robot used."""
+        cached = getattr(self, "_joint_tree", None)
+        if cached is not None:
+            return cached
+        tree = self.robot_model["body"]
+        children: dict[str, list[tuple[dict, str]]] = {}
+        child_ids = set()
+        for joint in tree["joints"]:
+            children.setdefault(joint["parent"], []).append((joint, joint["child"]))
+            child_ids.add(joint["child"])
+        root_id = tree["root"]
+        if isinstance(root_id, dict):
+            root_id = root_id.get("value")
+        if root_id not in children and root_id not in child_ids:
+            roots = [link["id"] for link in tree["links"] if link["id"] not in child_ids]
+            root_id = roots[0]
+        self._joint_tree = (children, root_id)
+        return self._joint_tree
+
+    def link_pose(self, link_id: str) -> dict:
+        """Pose of any link in the world frame, from this frame's joint encoders."""
+        children, root_id = self._tree()
+        path: list[tuple[dict, str]] = []
+        found = self._path_to(children, root_id, link_id, path, set())
+        if not found:
+            raise KeyError(f"robot model has no link {link_id!r} reachable from {root_id!r}")
+        pose = self.base_pose()
+        for joint, _ in path:
+            pose = _apply_joint(pose, joint, self.joints.get(joint["id"], 0.0))
+        return pose
+
+    def _path_to(self, children, here: str, target: str, path: list, seen: set[str]) -> bool:
+        if here == target:
+            return True
+        if here in seen:
+            return False
+        seen.add(here)
+        for joint, child in children.get(here, []):
+            path.append((joint, child))
+            if self._path_to(children, child, target, path, seen):
+                return True
+            path.pop()
+        return False
+
+    def camera_poses(self) -> dict[str, dict]:
+        """World pose of every camera the robot carries, keyed by sensor id."""
+        out = {}
+        tree = self.robot_model["body"]
+        for link in tree["links"]:
+            for sensor in link.get("sensors", []):
+                if sensor["kind"] in ("rgb", "depth", "rgbd"):
+                    out[sensor["id"]] = pose_compose(self.link_pose(link["id"]), sensor["mount"])
+        return out
 
     def base_pose(self) -> dict:
         o = self.odometry
         return {"p": [o["x"], o["y"], 0.0], "q": quat_from_yaw(o["yaw"])}
 
-    def camera_pose(self) -> dict:
-        return pose_compose(pose_compose(self.base_pose(), self._head_mount), self._camera["mount"])
+    def camera_pose(self, sensor_id: str | None = None) -> dict:
+        if sensor_id is None:
+            return pose_compose(self.link_pose(self._camera_link_id), self._camera["mount"])
+        return self.camera_poses()[sensor_id]
 
-    def gripper_position(self) -> np.ndarray:
-        """Gripper position from the robot's own kinematics (base, lift, reach)."""
+    def _camera_link(self) -> str:
+        return self._camera_link_id
+
+    def gripper_position(self, gripper_link: str | None = None) -> np.ndarray:
+        """Pinch point of a gripper, from the robot's own kinematics."""
         tree = self.robot_model["body"]
-        lift = next(j for j in tree["joints"] if j["id"] == "lift")
-        grip = next(j for j in tree["joints"] if j["id"] == "gripper_mount")
-        local_x = lift["origin"]["value"]["p"][0] + self.joints.get("reach", 0.0) + grip["origin"]["value"]["p"][0]
-        local = {"p": [local_x, 0.0, self.joints.get("lift", 0.0)], "q": [1, 0, 0, 0]}
-        return np.asarray(pose_compose(self.base_pose(), local)["p"])
+        if gripper_link is None:
+            gripper_link = next(link["id"] for link in tree["links"]
+                                if any((a if isinstance(a, str) else a.get("value")) == "grasp-point"
+                                       for a in link.get("affordances", [])))
+        pose = self.link_pose(gripper_link)
+        link = next(link for link in tree["links"] if link["id"] == gripper_link)
+        for affordance in link.get("affordances", []):
+            value = affordance.get("value") if isinstance(affordance, dict) else affordance
+            if isinstance(value, dict) and "tcp-offset" in value:
+                return np.asarray(pose_compose(pose, value["tcp-offset"])["p"])
+        return np.asarray(pose["p"])
 
     # ----------------------------------------------------------------- update
     def update(self, frame: dict) -> None:
@@ -996,6 +1067,24 @@ _COLORS = {"red": (0.85, 0.15, 0.15), "green": (0.15, 0.70, 0.25), "blue": (0.15
 
 ACHROMATIC_SATURATION = 0.18
 _CHROMATIC = {k: v for k, v in _COLORS.items() if k not in ("black", "white", "gray")}
+
+
+def _apply_joint(pose: dict, joint: dict, q: float) -> dict:
+    """Move ``pose`` across one joint by ``q`` (a joint angle in radians, or a slide in metres)."""
+    origin = joint["origin"]["value"]
+    kind = joint["type"]["value"] if isinstance(joint["type"], dict) else joint["type"]
+    at = pose_compose(pose, {"p": origin["p"], "q": origin["q"]})
+    if kind == "fixed":
+        return at
+    axis = joint["axis"]["value"] if isinstance(joint["axis"], dict) else joint["axis"]
+    axis = [float(v) for v in axis]
+    if kind == "prismatic":
+        offset = quat_rotate(at["q"], [axis[0] * q, axis[1] * q, axis[2] * q])
+        return {"p": [at["p"][i] + offset[i] for i in range(3)], "q": list(at["q"])}
+    if kind == "revolute":
+        spin = quat_from_axis_angle(axis, q)
+        return {"p": list(at["p"]), "q": quat_mul(at["q"], spin)}
+    raise ValueError(f"unsupported joint type {kind!r} for forward kinematics")
 
 
 def color_name(rgb: np.ndarray, invalid_frac: float = 0.0) -> str:

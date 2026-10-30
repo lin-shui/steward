@@ -302,9 +302,6 @@ def chores_spec() -> dict:
 
 KITCHEN_ASSETS = {
     "kitchen-room": ("building", {"width": 6.0, "depth": 5.0}),
-    "cobot-room": ("building", {"width": 4.0, "depth": 4.0, "height": 2.6}),
-    "cobot-table": ("dining_table", {"width": 0.7, "depth": 0.8}),
-    "cobot-magic": ("cobot_magic", {}),
     "counter": ("counter", {}),
     "sideboard": ("sideboard", {}),
     "drawer-cabinet": ("cabinet_with_drawer", {}),
@@ -387,9 +384,20 @@ def build_default_kitchen(service: AuthoringService) -> dict:
 
 def build_cobot_workstation(service: AuthoringService) -> dict:
     """Publish the Cobot Magic twin's assets, compose its workcell and save the cobot-table scenario."""
+    from steward.assets.cobot import cobot_magic
+
+    # The twin's generator lives in its own module and imports the shared generators' constants,
+    # so it is registered here rather than at import time (that would be a cycle).
+    GENERATORS.setdefault("cobot_magic", cobot_magic)
+    assets = {
+        "cobot-room": ("building", {"width": 4.0, "depth": 4.0, "height": 2.6}),
+        "cobot-table": ("dining_table", {"width": 0.7, "depth": 0.8}),
+        "cobot-magic": ("cobot_magic", {}),
+        "bowl": KITCHEN_ASSETS["bowl"],
+        "plate": KITCHEN_ASSETS["plate"],
+    }
     published = {}
-    for name in ("cobot-room", "cobot-table", "cobot-magic", "bowl", "plate"):
-        generator, params = KITCHEN_ASSETS[name]
+    for name, (generator, params) in assets.items():
         created = service.create_asset(generator=generator, params=params)
         if not created["validation"]["ok"]:
             raise AuthoringError(f"generated asset {name} failed validation: {created['validation']['errors']}")

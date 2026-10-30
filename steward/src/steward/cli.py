@@ -240,9 +240,12 @@ def cmd_build_cobot(args) -> int:
 
 
 def cmd_cobot(args) -> int:
-    """Run the Cobot Magic twin with its console and a scripted pick-and-place, kept open for viewing."""
+    """Run the Cobot Magic twin with its console; the mission is driven by the robot's own perception."""
+    from steward.assets.cobot import cobot_magic
     from steward.authoring.service import AuthoringService, build_cobot_workstation
+    from steward.ego.cobot_mission import bowl_onto_plate
     from steward.ego.cobot_skills import CobotSkills
+    from steward.ego.estimator import EgoEstimator
 
     if "cobot-table" not in AuthoringService(args.root).list_scenarios():
         build_cobot_workstation(AuthoringService(args.root))
@@ -251,40 +254,46 @@ def cmd_cobot(args) -> int:
     sim = host.sim
     robot_id = host.scenario["robots"][0]
     skills = CobotSkills(command=lambda cmd: sim.command(robot_id, cmd), state=lambda: sim.sensors(robot_id))
+    est = EgoEstimator(robot_model=cobot_magic().to_dict())
     print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
                       "robot": host.robot_servers[robot_id].url, "task": host.scenario["task"],
+                      "perception": "ground-truth" if args.ground_truth else "estimated",
                       "runDir": str(run_dir)}, ensure_ascii=False), flush=True)
-
-    def pose_of(object_id: str) -> list[float]:
-        state = sim.world_state()
-        return list(next(e for e in state["entities"] if e["id"] == object_id)["pose"]["value"]["p"])
 
     outcome: dict = {}
 
-    def run_mission() -> None:
+    def run_truth_mission() -> None:
+        """Escape hatch for debugging the skills: aim at the true object poses."""
+        def pose_of(object_id: str) -> list[float]:
+            state = sim.world_state()
+            return list(next(e for e in state["entities"] if e["id"] == object_id)["pose"]["value"]["p"])
+
+        bowl = pose_of("w:bowl-1")
+        bowl[2] += 0.03
+        plate = pose_of("w:plate-1")
+        target = [plate[0], plate[1], plate[2] + 0.03]
+        for name, plan in (("pick", {"arm": "L", "at": bowl}), ("place", {"arm": "L", "at": target})):
+            job = skills.start(name, {"id": f"cli-{name}", "plan": plan})
+            while job.state == "running":
+                time.sleep(0.05)  # the main thread owns pump(); the job thread must not
+            print(json.dumps({"skill": name, "state": job.state, "message": job.message,
+                              "log": job.log}, ensure_ascii=False), flush=True)
+            if job.state != "succeeded":
+                outcome["error"] = job.message
+                return
+        outcome["done"] = True
+
+    def run_sensed_mission() -> None:
         try:
-            bowl = pose_of("w:bowl-1")
-            bowl[2] += 0.03  # grasp at the bowl's middle, not its base
-            plate = pose_of("w:plate-1")
-            target = [plate[0], plate[1], plate[2] + 0.03]  # set it down on the plate
-            neutral = dict(zip(skills.ik.joint_names("L"), skills.ik.neutral("L"), strict=True))
-            for name, plan in (("pick", {"arm": "L", "at": bowl}),
-                               ("place", {"arm": "L", "at": target}),
-                               ("move_joints", {"arm": "L", "joints": neutral})):
-                job = skills.start(name, {"id": f"cli-{name}", "plan": plan})
-                while job.state == "running":
-                    time.sleep(0.05)  # the main thread owns pump(); the job thread must not
-                print(json.dumps({"skill": name, "state": job.state, "message": job.message,
-                                  "log": job.log}, ensure_ascii=False), flush=True)
-                if job.state != "succeeded":
-                    outcome["error"] = job.message
-                    return
-            outcome["done"] = True
+            result = bowl_onto_plate(est, skills, lambda: sim.sensors(robot_id))
+            outcome.update(result)
+            print(json.dumps({"mission": "bowl-on-plate", **result}, ensure_ascii=False), flush=True)
         except Exception as exc:  # noqa: BLE001 - reported to the operator, console stays up
             outcome["error"] = f"{type(exc).__name__}: {exc}"
             print(json.dumps(outcome, ensure_ascii=False), flush=True)
 
-    worker = threading.Thread(target=run_mission, name="cobot-mission", daemon=True)
+    worker = threading.Thread(target=run_truth_mission if args.ground_truth else run_sensed_mission,
+                              name="cobot-mission", daemon=True)
     worker.start()
     _wait_forever([host.stop], host.pump)
     return 0
@@ -493,7 +502,8 @@ def main(argv: list[str] | None = None) -> int:
         in_process = name in ("demo", "shuttle", "chores", "cobot")
         p.add_argument("--speed", type=float, default=4.0 if in_process else 1.0)
         p.add_argument("--seed", type=int, default=0)
-        p.add_argument("--phase", choices=sorted(PHASES), default=LATEST_PHASE,
+        p.add_argument("--phase", choices=sorted(PHASES),
+                       default="phase0" if name == "cobot" else LATEST_PHASE,
                        help="phase level of the replaceable modules (switchable at run time from the console)")
         p.add_argument("--wca-port", type=int, default=0 if in_process else 7400)
         p.add_argument("--robot-port", type=int, default=0 if in_process else 7410)
@@ -518,6 +528,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--wca", default="http://127.0.0.1:7400", help="WCA of the running world (with --api)")
         if name == "shuttle":
             p.add_argument("--steps", type=int, default=6, help="number of moves; 0 repeats until Ctrl-C")
+        if name == "cobot":
+            p.add_argument("--ground-truth", action="store_true",
+                           help="aim the skills at true object poses instead of the robot's estimates (debugging)")
             p.add_argument("--api", help="Ego API of a running `steward up`; omit to run in-process")
             p.add_argument("--wca", default="http://127.0.0.1:7400", help="WCA of the running world (with --api)")
         p.set_defaults(fn=fn)
