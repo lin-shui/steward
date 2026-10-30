@@ -444,3 +444,13 @@ GENERATORS: dict[str, Callable[..., Entity]] = {
     "chair": chair,
     "steward_bot": steward_bot,
 }
+
+
+def _register_cobot() -> None:
+    """Register the agilex embodiment's generator without making every import pay for it."""
+    from steward.assets.cobot import cobot_magic
+
+    GENERATORS["cobot_magic"] = cobot_magic
+
+
+_register_cobot()

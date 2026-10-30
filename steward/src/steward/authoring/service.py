@@ -302,6 +302,9 @@ def chores_spec() -> dict:
 
 KITCHEN_ASSETS = {
     "kitchen-room": ("building", {"width": 6.0, "depth": 5.0}),
+    "cobot-room": ("building", {"width": 4.0, "depth": 4.0, "height": 2.6}),
+    "cobot-table": ("dining_table", {"width": 0.7, "depth": 0.8}),
+    "cobot-magic": ("cobot_magic", {}),
     "counter": ("counter", {}),
     "sideboard": ("sideboard", {}),
     "drawer-cabinet": ("cabinet_with_drawer", {}),
@@ -327,6 +330,26 @@ KITCHEN_ASSETS = {
     "perfume-bottle": ("perfume_bottle", {}),
     "chair": ("chair", {}),
 }
+
+
+def cobot_spec() -> dict:
+    """The Cobot Magic workstation: one tabletop in front of the twin, a bowl and a plate on it."""
+    return {
+        "name": "cobot-table",
+        "entities": [
+            {"id": "w:room", "asset": "cobot-room", "at": {"x": 0.0, "y": 0.0}},
+            {"id": "w:table-1", "asset": "cobot-table", "at": {"x": 0.45, "y": 0.0}},
+            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
+            # Table centre is (0.45, 0); these land the tableware in the left arm's reachable band,
+            # where a strictly vertical tool can still descend (see tests/test_cobot_skills.py).
+            {"id": "w:bowl-1", "asset": "bowl", "on": "w:table-1", "offset": [-0.17, 0.25]},
+            {"id": "w:plate-1", "asset": "plate", "on": "w:table-1", "offset": [-0.15, 0.02]},
+        ],
+        "regions": [{"id": "workcell", "label": "workcell", "polygon": [[-2, -2], [2, -2], [2, 2], [-2, 2]]}],
+    }
+
+
+COBOT_TASK = "把碗搬到盘子上；一次只用一个夹爪，搬完再回到停放姿态。"
 
 
 def build_default_kitchen(service: AuthoringService) -> dict:
@@ -358,5 +381,25 @@ def build_default_kitchen(service: AuthoringService) -> dict:
         "scene": "phase0-chores",
         "robots": ["w:robot-1"],
         "task": CHORES_TASK,
+    })
+    return {"assets": {k: v["version"][:12] for k, v in published.items()}, "scene": scene, "scenario": scenario}
+
+
+def build_cobot_workstation(service: AuthoringService) -> dict:
+    """Publish the Cobot Magic twin's assets, compose its workcell and save the cobot-table scenario."""
+    published = {}
+    for name in ("cobot-room", "cobot-table", "cobot-magic", "bowl", "plate"):
+        generator, params = KITCHEN_ASSETS[name]
+        created = service.create_asset(generator=generator, params=params)
+        if not created["validation"]["ok"]:
+            raise AuthoringError(f"generated asset {name} failed validation: {created['validation']['errors']}")
+        published[name] = service.publish_asset(name, created["template"],
+                                                meta={"generator": generator, "params": params})
+    scene = service.compose_scene(cobot_spec())
+    scenario = service.save_scenario({
+        "name": "cobot-table",
+        "scene": "cobot-table",
+        "robots": ["w:cobot-1"],
+        "task": COBOT_TASK,
     })
     return {"assets": {k: v["version"][:12] for k, v in published.items()}, "scene": scene, "scenario": scenario}

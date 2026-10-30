@@ -231,6 +231,65 @@ def cmd_demo(args) -> int:
     return 0 if ok_mission and on_table else 1
 
 
+def cmd_build_cobot(args) -> int:
+    from steward.authoring.service import AuthoringService, build_cobot_workstation
+
+    out = build_cobot_workstation(AuthoringService(args.root))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_cobot(args) -> int:
+    """Run the Cobot Magic twin with its console and a scripted pick-and-place, kept open for viewing."""
+    from steward.authoring.service import AuthoringService, build_cobot_workstation
+    from steward.ego.cobot_skills import CobotSkills
+
+    if "cobot-table" not in AuthoringService(args.root).list_scenarios():
+        build_cobot_workstation(AuthoringService(args.root))
+    run_dir = Path(args.root) / "runs" / ("cobot-" + time.strftime("%Y%m%d-%H%M%S"))
+    host = _host(args, run_dir)
+    sim = host.sim
+    robot_id = host.scenario["robots"][0]
+    skills = CobotSkills(command=lambda cmd: sim.command(robot_id, cmd), state=lambda: sim.sensors(robot_id))
+    print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
+                      "robot": host.robot_servers[robot_id].url, "task": host.scenario["task"],
+                      "runDir": str(run_dir)}, ensure_ascii=False), flush=True)
+
+    def pose_of(object_id: str) -> list[float]:
+        state = sim.world_state()
+        return list(next(e for e in state["entities"] if e["id"] == object_id)["pose"]["value"]["p"])
+
+    outcome: dict = {}
+
+    def run_mission() -> None:
+        try:
+            bowl = pose_of("w:bowl-1")
+            bowl[2] += 0.03  # grasp at the bowl's middle, not its base
+            plate = pose_of("w:plate-1")
+            target = [plate[0], plate[1], plate[2] + 0.03]  # set it down on the plate
+            neutral = dict(zip(skills.ik.joint_names("L"), skills.ik.neutral("L"), strict=True))
+            for name, plan in (("pick", {"arm": "L", "at": bowl}),
+                               ("place", {"arm": "L", "at": target}),
+                               ("move_joints", {"arm": "L", "joints": neutral})):
+                job = skills.start(name, {"id": f"cli-{name}", "plan": plan})
+                while job.state == "running":
+                    time.sleep(0.05)  # the main thread owns pump(); the job thread must not
+                print(json.dumps({"skill": name, "state": job.state, "message": job.message,
+                                  "log": job.log}, ensure_ascii=False), flush=True)
+                if job.state != "succeeded":
+                    outcome["error"] = job.message
+                    return
+            outcome["done"] = True
+        except Exception as exc:  # noqa: BLE001 - reported to the operator, console stays up
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
+            print(json.dumps(outcome, ensure_ascii=False), flush=True)
+
+    worker = threading.Thread(target=run_mission, name="cobot-mission", daemon=True)
+    worker.start()
+    _wait_forever([host.stop], host.pump)
+    return 0
+
+
 def _ground_truth_locations(scene: dict, supports: list[str], objects: list[str]) -> dict[str, str | None]:
     """Support category under each carried object category, from World State relations."""
     category = {e["id"]: e["category"]["value"] for e in scene["entities"]}
@@ -425,12 +484,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=str(DEFAULT_ROOT), help="Steward data root (assets, scenes, runs)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("build-kitchen").set_defaults(fn=cmd_build_kitchen)
-    defaults = {"demo": "phase0-kitchen", "shuttle": "phase0-shuttle"}
+    sub.add_parser("build-cobot").set_defaults(fn=cmd_build_cobot)
+    defaults = {"demo": "phase0-kitchen", "shuttle": "phase0-shuttle", "cobot": "cobot-table"}
     for name, fn in (("world", cmd_world), ("up", cmd_up), ("demo", cmd_demo), ("shuttle", cmd_shuttle),
-                     ("chores", cmd_chores)):
+                     ("chores", cmd_chores), ("cobot", cmd_cobot)):
         p = sub.add_parser(name)
         p.add_argument("--scenario", default=defaults.get(name, "phase0-chores"))
-        in_process = name in ("demo", "shuttle", "chores")
+        in_process = name in ("demo", "shuttle", "chores", "cobot")
         p.add_argument("--speed", type=float, default=4.0 if in_process else 1.0)
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--phase", choices=sorted(PHASES), default=LATEST_PHASE,
