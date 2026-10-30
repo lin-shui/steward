@@ -125,6 +125,7 @@ class WorldSim:
         self.paused = False
         self.events: list[dict] = []
         self._render_requests: queue.Queue[_RenderRequest] = queue.Queue()
+        self._realsegs: dict = {}  # robot id -> world.realseg.RealSegmenter, when enabled
         self._load(self._initial_scene)
 
     # ------------------------------------------------------------------ setup
@@ -375,6 +376,8 @@ class WorldSim:
 
     def stop(self) -> None:
         self._running = False
+        for segmenter in self._realsegs.values():
+            segmenter.stop()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
@@ -678,6 +681,31 @@ class WorldSim:
         return [(ent.id, rest, ent.category.value)] + [(f"{ent.id}/{d}", [d], "drawer") for d in drawers]
 
     def rgbd(self, robot_id: str, timeout: float = 10.0) -> bytes:
+        """One RGB-D frame of a robot's head camera. With ``STEWARD_SEGMENTER_URL`` set the
+        masks come from the real segmenter worker instead of the synthetic channel (see
+        :mod:`steward.world.realseg`); each frame is long-polled and served exactly once."""
+        segmenter = self._realseg(robot_id)
+        if segmenter is not None:
+            blob = segmenter.get(timeout - 2.0)
+            if blob is not None:
+                return blob
+        return self._rgbd_render(robot_id, timeout)
+
+    def _realseg(self, robot_id: str):
+        """The robot's real-segmentation worker, or None unless STEWARD_SEGMENTER_URL is set."""
+        import os
+
+        url = os.environ.get("STEWARD_SEGMENTER_URL")
+        if not url:
+            return None
+        if robot_id not in self._realsegs:
+            from steward.world.realseg import RealSegmenter
+
+            self._realsegs[robot_id] = RealSegmenter(self, robot_id, url)
+            self._realsegs[robot_id].start()
+        return self._realsegs[robot_id]
+
+    def _rgbd_render(self, robot_id: str, timeout: float = 10.0) -> bytes:
         """One RGB-D frame of a robot's head camera as compressed ``npz`` bytes: ``rgb`` (H, W, 3)
         uint8, ``depth`` (H, W) uint16 millimetres (0 = no reading), ``mask`` (H, W) uint8 anonymous
         instance ids (0 = background; ids are shuffled every frame and carry no World State
