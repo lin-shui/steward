@@ -277,6 +277,7 @@ def cmd_cobot(args) -> int:
     from steward.assets.cobot import cobot_magic
     from steward.authoring.service import AuthoringService, build_cobot_workstation
     from steward.ego.cobot_mission import bowl_onto_plate
+    from steward.ego.cobot_server import cobot_ego_api
     from steward.ego.cobot_skills import CobotSkills
     from steward.ego.estimator import EgoEstimator
     from steward.ego.perception import decode_rgbd
@@ -291,13 +292,17 @@ def cmd_cobot(args) -> int:
     skills = CobotSkills(command=lambda cmd: sim.command(robot_id, cmd), state=lambda: sim.sensors(robot_id))
     est = EgoEstimator(robot_model=cobot_magic().to_dict())
     rgbd = phase_modules(args.phase)["perception"] == "rgbd"
+    # The console's Ego State panel is rendered from the mission's own estimator, so the operator
+    # watches the belief the skills are acting on -- not a second, independent one.
+    ego = cobot_ego_api(est, port=0)
+    host.attach_ego_api(robot_id, ego.url)
 
     def sensed_frame() -> dict:
         return decode_rgbd(sim.rgbd(robot_id, camera="top_camera")) if rgbd else sim.sensors(robot_id)
 
     print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
-                      "robot": host.robot_servers[robot_id].url, "task": host.scenario["task"],
-                      "phase": args.phase,
+                      "robot": host.robot_servers[robot_id].url, "egoApi": ego.url,
+                      "task": host.scenario["task"], "phase": args.phase,
                       "perception": "ground-truth" if args.ground_truth else ("rgbd" if rgbd else "detections"),
                       "runDir": str(run_dir)}, ensure_ascii=False), flush=True)
 
@@ -336,7 +341,7 @@ def cmd_cobot(args) -> int:
     worker = threading.Thread(target=run_truth_mission if args.ground_truth else run_sensed_mission,
                               name="cobot-mission", daemon=True)
     worker.start()
-    _wait_forever([host.stop], host.pump)
+    _wait_forever([ego.stop, host.stop], host.pump)
     return 0
 
 
