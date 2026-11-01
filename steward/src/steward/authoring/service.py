@@ -455,7 +455,9 @@ def build_cobot_kitchen(service: AuthoringService) -> dict:
     assets = {
         "kitchen-room": KITCHEN_ASSETS["kitchen-room"],
         "cobot-magic": ("cobot_magic", {}),
-        "cobot-kitchen-table": ("dining_table", {"width": 0.9, "depth": 1.0}),
+        # 0.8 x 0.8 under the overhead camera's cone: the whole top has to be inside the frame,
+        # or the table never becomes a track (see assets/cobot.py's top_camera note).
+        "cobot-kitchen-table": ("dining_table", {"width": 0.8, "depth": 0.8}),
         "bowl-red-large": KITCHEN_ASSETS["bowl-red-large"],
         "bowl-green-medium": KITCHEN_ASSETS["bowl-green-medium"],
         "bowl-blue-small": KITCHEN_ASSETS["bowl-blue-small"],

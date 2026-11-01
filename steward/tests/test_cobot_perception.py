@@ -124,3 +124,61 @@ def test_proprioception_leaves_the_perception_noise_stream_alone(rig) -> None:
     for _ in range(5):
         sim.proprioception("w:cobot")
     assert sim.sensors("w:cobot")["odometry"] == baseline
+
+
+def test_a_dual_arm_load_follows_the_arm_that_holds_it(rig) -> None:
+    """Two grippers, no single "gripper" field: the load must follow the arm that took it.
+
+    Before this, a dual-arm frame left the estimator with an open gripper for ever, so the Ego
+    State never showed a bowl in the hand -- the panel had the arm moving empty while the world had
+    it carrying one.
+    """
+    from steward.ego.estimator import Track
+
+    sim, est = rig
+    _sync(est, sim)
+    at = est.gripper_position("R_link6")
+    track = Track(id="e:loaded", category_counts={"bowl": 1.0}, pos=at.copy(), var=np.full(3, 1e-4),
+                  yaw=0.0, yaw_var=1e-4, size=np.array([0.2, 0.2, 0.06]), observations=3,
+                  first_seen=0.0, last_seen=est.stamp)
+    est.tracks[track.id] = track
+    est.mark_held(track.id, gripper="R_link6", at=at)
+
+    def frame_with_right_holding() -> dict:
+        frame = sim.sensors("w:cobot")
+        frame["grippers"] = {"L_link6": {"state": "open", "holding": False, "holdingHandle": False},
+                             "R_link6": {"state": "closed", "holding": True, "holdingHandle": False}}
+        return frame
+
+    est.update(frame_with_right_holding())
+    assert est.gripper["state"] == "closed" and est.gripper["holding"] is True
+    assert np.linalg.norm(track.pos - est.gripper_position("R_link6")) < 1e-6
+
+    # Move the right arm: the load goes with it, and the left arm's pose stays irrelevant.
+    sim.command("w:cobot", {"joints": {"R_joint1": -0.6, "R_joint2": 0.9, "R_joint3": -2.0}})
+    sim.step(400)
+    est.update(frame_with_right_holding())
+    assert np.linalg.norm(track.pos - est.gripper_position("R_link6")) < 1e-3
+    assert np.linalg.norm(track.pos - est.gripper_position("L_link6")) > 0.10
+
+    # And the rendered Ego State puts it there too, without the track being rewritten.
+    live = sim.proprioception("w:cobot")
+    scene = est.to_scene(live)
+    rendered = next(ent for ent in scene.entities if ent.id == track.id)
+    assert np.linalg.norm(np.subtract(rendered.pose.value["p"], est.gripper_position("R_link6", live["joints"]))) < 1e-3
+
+    # A grasp recorded with the pinch point it closed at needs no fresh encoders: the offset is
+    # measured there, so a body that looks only between moves still carries the object by the hand.
+    track.pos = np.array([0.31, 0.29, 0.78])
+    est.mark_held(track.id, gripper="R_link6", at=np.array([0.30, 0.30, 0.78]))
+    assert np.linalg.norm(track.held_offset - np.array([0.01, -0.01, 0.0])) < 1e-9
+
+    # Opening that gripper puts the load down where it is.
+    frame = frame_with_right_holding()
+    frame["grippers"]["R_link6"] = {"state": "open", "holding": False, "holdingHandle": False}
+    est.update(frame)
+    assert est.held_id is None and est.held_gripper is None
+    assert track.held is False
+    # It is believed where the hand let go of it, not where it was picked up -- otherwise the
+    # next look measures a bowl 30 cm from the stale position and starts a second track for it.
+    assert np.linalg.norm(track.pos - est.gripper_position("R_link6") - np.array([0.01, -0.01, 0.0])) < 1e-3

@@ -112,7 +112,9 @@ class EgoEstimator:
         self.odometry = {"x": 0.0, "y": 0.0, "yaw": 0.0, "sigma": {"pos": 0.01, "yaw": 0.01}}
         self.joints: dict[str, float] = {}
         self.gripper = {"state": "open", "holding": False}
+        self.grippers: dict[str, dict] = {}
         self.held_id: str | None = None
+        self.held_gripper: str | None = None
         self._rng = np.random.default_rng(0)
         self._self_template = self._make_self_template()
         self._camera_link_id, self._camera = self._camera_model()
@@ -157,16 +159,20 @@ class EgoEstimator:
         self._joint_tree = (children, root_id)
         return self._joint_tree
 
-    def link_pose(self, link_id: str) -> dict:
-        """Pose of any link in the world frame, from this frame's joint encoders."""
+    def link_pose(self, link_id: str, joints: dict | None = None) -> dict:
+        """Pose of any link in the world frame, from joint encoders.
+
+        ``joints`` overrides the estimator's own last-seen encoders: the Ego-State view asks for
+        the pose the arm is in *now*, which is a read, not a perception update."""
         children, root_id = self._tree()
         path: list[tuple[dict, str]] = []
         found = self._path_to(children, root_id, link_id, path, set())
         if not found:
             raise KeyError(f"robot model has no link {link_id!r} reachable from {root_id!r}")
+        q = self.joints if joints is None else joints
         pose = self.base_pose()
         for joint, _ in path:
-            pose = _apply_joint(pose, joint, self.joints.get(joint["id"], 0.0))
+            pose = _apply_joint(pose, joint, q.get(joint["id"], 0.0))
         return pose
 
     def _path_to(self, children, here: str, target: str, path: list, seen: set[str]) -> bool:
@@ -204,14 +210,14 @@ class EgoEstimator:
     def _camera_link(self) -> str:
         return self._camera_link_id
 
-    def gripper_position(self, gripper_link: str | None = None) -> np.ndarray:
+    def gripper_position(self, gripper_link: str | None = None, joints: dict | None = None) -> np.ndarray:
         """Pinch point of a gripper, from the robot's own kinematics."""
         tree = self.robot_model["body"]
         if gripper_link is None:
             gripper_link = next(link["id"] for link in tree["links"]
                                 if any((a if isinstance(a, str) else a.get("value")) == "grasp-point"
                                        for a in link.get("affordances", [])))
-        pose = self.link_pose(gripper_link)
+        pose = self.link_pose(gripper_link, joints)
         link = next(link for link in tree["links"] if link["id"] == gripper_link)
         for affordance in link.get("affordances", []):
             value = affordance.get("value") if isinstance(affordance, dict) else affordance
@@ -224,8 +230,7 @@ class EgoEstimator:
         self.stamp = float(frame["stamp"])
         self.odometry = frame["odometry"]
         self.joints = frame["joints"]
-        # single-gripper robots report "gripper"; multi-gripper frames carry "grippers" per link
-        self.gripper = frame.get("gripper") or {"state": "open", "holding": False, "holdingHandle": False}
+        self._read_grippers(frame)
         if not self.gripper.get("holding"):
             self._clear_held()
         # A held object moves with this frame's body pose; update it before association so a
@@ -270,7 +275,7 @@ class EgoEstimator:
         self.stamp = float(header["stamp"])
         self.odometry = header["odometry"]
         self.joints = header["joints"]
-        self.gripper = header.get("gripper") or {"state": "open", "holding": False, "holdingHandle": False}
+        self._read_grippers(header)
         if not self.gripper.get("holding"):
             self._clear_held()
         self._follow_held()
@@ -889,34 +894,77 @@ class EgoEstimator:
         self.version += 1
 
     # ---------------------------------------------------------------- holding
-    def mark_held(self, track_id: str, since: float | None = None) -> None:
+    def mark_held(self, track_id: str, since: float | None = None, gripper: str | None = None,
+                  at: list[float] | None = None) -> None:
         """Record the grasp. ``since`` is the body's clock at the moment the gripper closed: a
         frame rendered before that moment still reports an open gripper, and must not be read as
         the load having been dropped. With a real segmenter frames are seconds apart, so without
-        this every grasp would be forgotten by the next frame that arrives."""
+        this every grasp would be forgotten by the next frame that arrives.
+
+        ``gripper`` is the link that took the load. A dual-arm body needs it: the load follows the
+        arm that is actually holding it, and the other arm's gripper state says nothing about it.
+        ``at`` is the pinch point the gripper closed at. Without it the offset is measured against
+        this estimator's last-seen encoders, which for a body that only looks between moves is the
+        posture from *before* the approach -- the load would then hang half a metre from the hand."""
         track = self.tracks[track_id]
         self.held_since = max(self.stamp, float(since) if since is not None else self.stamp)
+        self.held_gripper = gripper
+        closed_at = self.gripper_position(gripper) if at is None else np.asarray(at, dtype=float)
         track.held = True
-        track.held_offset = track.pos - self.gripper_position()
+        track.held_offset = track.pos - closed_at
         track.recent.clear()  # it will be put down elsewhere
         self.held_id = track_id
+
+    def _read_grippers(self, frame: dict) -> None:
+        """The gripper state this frame reports, for a single gripper or for one per arm.
+
+        A one-armed robot sends ``gripper``. A dual-arm body sends ``grippers`` per link and no
+        summary, because "closed" would have to say which arm — so while a load is held this reads
+        the arm that holds it, and otherwise reports whether any of them is holding."""
+        self.grippers = dict(frame.get("grippers") or {})
+        if self.held_gripper in self.grippers:
+            self.gripper = self.grippers[self.held_gripper]
+        elif frame.get("gripper"):
+            self.gripper = frame["gripper"]
+        elif self.grippers:
+            self.gripper = {"state": "closed" if any(g.get("state") == "closed" for g in self.grippers.values()) else "open",
+                            "holding": any(g.get("holding") for g in self.grippers.values()),
+                            "holdingHandle": any(g.get("holdingHandle") for g in self.grippers.values())}
+        else:
+            self.gripper = {"state": "open", "holding": False, "holdingHandle": False}
 
     def _clear_held(self) -> None:
         if self.stamp < self.held_since - 1e-6:
             return  # this frame was rendered while the gripper was still open
+        gripper = self.held_gripper
         if self.held_id and self.held_id in self.tracks:
             track = self.tracks[self.held_id]
+            # It is where the hand let go of it, not where it was picked up: the arm carried it
+            # across the table, and a look taken after the release must recognise it there rather
+            # than find a second bowl at the old place.
+            if track.held_offset is not None:
+                track.pos = self.gripper_position(gripper) + track.held_offset
             track.held = False
             track.held_offset = None
             track.voxels = None
             track.settled = False  # it drops a little when released; the next view places it
             track.var = np.maximum(track.var, 0.02**2)
         self.held_id = None
+        self.held_gripper = None
 
     def _follow_held(self) -> None:
         if self.held_id and self.held_id in self.tracks:
             track = self.tracks[self.held_id]
-            track.pos = self.gripper_position() + track.held_offset
+            track.pos = self.gripper_position(self.held_gripper) + track.held_offset
+
+    def held_position(self, joints: dict | None = None):
+        """Where the load is, for the given joint state: in the gripper that took it."""
+        if not self.held_id or self.held_id not in self.tracks:
+            return None
+        track = self.tracks[self.held_id]
+        if track.held_offset is None:
+            return np.asarray(track.pos, dtype=float)
+        return self.gripper_position(self.held_gripper, joints) + track.held_offset
 
     # ------------------------------------------------------------------ output
     def support_of(self, track: Track) -> Track | None:
@@ -1020,9 +1068,12 @@ class EgoEstimator:
         never refreshed by it.
         """
         entities = [self._self_entity(self_frame)]
+        # A held object is not where the last look saw it: it is in the hand. That is a kinematic
+        # fact, so it is read here rather than mutating the track from a rendering thread.
+        held_at = self.held_position(None if self_frame is None else self_frame.get("joints"))
         relations: list[Relation] = []
         for track in self.tracks.values():
-            entities.append(self._track_entity(track))
+            entities.append(self._track_entity(track, at=held_at if track.id == self.held_id else None))
             if track.held:
                 relations.append(Relation(type="attached", a={"entity": track.id}, b={"entity": SELF_ID, "link": "gripper"},
                                           mode="rigid", derived=False, confidence=1.0))
@@ -1053,7 +1104,7 @@ class EgoEstimator:
         ent.state_vars["holding"] = Est(value=gripper.get("holding", False), t=stamp, src="observed")
         return ent
 
-    def _track_entity(self, track: Track) -> Entity:
+    def _track_entity(self, track: Track, at=None) -> Entity:
         p = prior(track.category)
         total = sum(track.category_counts.values())
         cat_unc = {"kind": "categorical", "p": {k: round(v / total, 4) for k, v in track.category_counts.items()}}
@@ -1071,7 +1122,8 @@ class EgoEstimator:
             id=track.id,
             role=p["role"],
             category=Est(value=track.category, unc=cat_unc, t=track.last_seen, src=src),
-            pose=Est(value={"p": track.pos.tolist(), "q": quat_from_yaw(track.yaw)},
+            pose=Est(value={"p": (track.pos if at is None else np.asarray(at, dtype=float)).tolist(),
+                            "q": quat_from_yaw(track.yaw)},
                      unc=_gaussian6([*track.var.tolist(), 1e-4, 1e-4, track.yaw_var]), t=track.last_seen, src=src),
             body=RigidTree(root=Est(value=root_value, unc={"kind": "categorical", "p": p["root"]}, src="prior"),
                            links=[link]),

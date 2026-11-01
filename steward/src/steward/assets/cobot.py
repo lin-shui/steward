@@ -180,7 +180,12 @@ def cobot_magic(separation: float = 0.62, mount_height: float = 0.79,
     where the frame link sits; the arms are mounted ``mount_height`` up and the overhead camera
     looks straight down on the table from above the workcell.
     """
-    top_camera = list(top_camera) if top_camera is not None else [0.35, 0.10, 1.60]
+    # Centred over the table it watches, so a whole tabletop fits in the frame at this height. A
+    # camera whose view cuts the table is not just coarse: a region cut by the image border is only
+    # part of something and never becomes a track, so the table would be invisible to the robot's
+    # own state for ever -- and raising the camera to fit a bigger table costs the small objects
+    # the accuracy they are grasped with (measured: a plate's estimate wanders 2.3 cm at 1.85 m).
+    top_camera = list(top_camera) if top_camera is not None else [0.42, 0.05, 1.60]
     frame = Link(
         id="frame", name="cobot magic frame",
         # A slim back column rather than a full-depth box: the workspace in front of the arms is

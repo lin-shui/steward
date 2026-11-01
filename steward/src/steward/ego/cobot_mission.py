@@ -115,6 +115,7 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
                   plate_top + 0.5 * _extent(bowl.size, 2, 0.05) + 0.005]
         try:
             _run(skills, "pick", {"grip": grip, "arm": "L", "at": [float(v) for v in bowl.pos]}, log)
+            est.mark_held(bowl.track_id, gripper=grip, at=bowl.pos)
             _run(skills, "place", {"grip": grip, "arm": "L", "at": target}, log)
         except SkillStopped:
             raise
@@ -159,6 +160,9 @@ def nest_bowls(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], dict]
                 rest = floor + 0.5 * _extent(small.size, 2, 0.05)
                 target = [float(base.pos[0]), float(base.pos[1]), rest + _NEST_DROP]
                 _run(skills, "pick", {"arm": arm, "gripper": grip, "at": [float(v) for v in small.pos]}, log)
+                # The robot knows what it just picked up: the load follows that arm from here on,
+                # so the Ego State shows the bowl in the hand instead of leaving it on the table.
+                est.mark_held(small.track_id, gripper=grip, at=small.pos)
                 _run(skills, "place", {"arm": arm, "gripper": grip, "at": target}, log)
                 placed.append(small.track_id)
                 # After it drops, the bowl rests on the floor it was released over.
