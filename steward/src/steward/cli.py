@@ -40,6 +40,13 @@ def _robot_model() -> dict:
     return steward_bot().to_dict()
 
 
+def _tableware(ent) -> bool:
+    """A movable object on the scene: everything an object that is not itself a support surface."""
+    if ent.role != "object":
+        return False
+    return not any(a.value == "support-surface" for link in ent.rigid.links for a in link.affordances)
+
+
 def _wait_forever(stoppers: list, pump=None) -> None:
     """Block until SIGINT/SIGTERM; the main thread serves render requests through ``pump``."""
     done = threading.Event()
@@ -274,19 +281,29 @@ def cmd_build_cobot(args) -> int:
     return 0
 
 
+def cmd_build_cobot_kitchen(args) -> int:
+    from steward.authoring.service import AuthoringService, build_cobot_kitchen
+
+    out = build_cobot_kitchen(AuthoringService(args.root))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_cobot(args) -> int:
     """Run the Cobot Magic twin with its console; the mission is driven by the robot's own perception."""
     from steward.assets.cobot import cobot_magic
-    from steward.authoring.service import AuthoringService, build_cobot_workstation
-    from steward.ego.cobot_mission import bowl_onto_plate
+    from steward.authoring.service import AuthoringService, build_cobot_kitchen, build_cobot_workstation
+    from steward.ego.cobot_mission import bowl_onto_plate, nest_bowls
     from steward.ego.cobot_server import cobot_ego_api
     from steward.ego.cobot_skills import CobotSkills
     from steward.ego.estimator import EgoEstimator
     from steward.ego.perception import decode_rgbd
     from steward.phases import phase_modules
 
-    if "cobot-table" not in AuthoringService(args.root).list_scenarios():
-        build_cobot_workstation(AuthoringService(args.root))
+    args.scenario = args.scenario or ("cobot-kitchen" if args.task == "nest-bowls" else "cobot-table")
+    service = AuthoringService(args.root)
+    if args.scenario not in service.list_scenarios():
+        (build_cobot_kitchen if args.task == "nest-bowls" else build_cobot_workstation)(service)
     run_dir = Path(args.root) / "runs" / ("cobot-" + time.strftime("%Y%m%d-%H%M%S"))
     host = _host(args, run_dir)
     sim = host.sim
@@ -310,25 +327,28 @@ def cmd_cobot(args) -> int:
                       "runDir": str(run_dir)}, ensure_ascii=False), flush=True)
 
     outcome: dict = {}
-    bowl_home = next(list(e["pose"]["value"]["p"]) for e in sim.world_state()["entities"]
-                     if e["id"] == "w:bowl-1")
+    homes = {ent.id: list(next(e for e in sim.world_state()["entities"] if e["id"] == ent.id)["pose"]["value"]["p"])
+             for ent in sim.template.entities if _tableware(ent)}
 
     def reset_for_next_round() -> None:
-        """Park the arm, put the bowl back where the round started, and let the robot look again.
+        """Park both arms, put every piece of tableware back where the round started, and let the
+        robot look again.
 
-        Parking first is not cosmetic: a round ends with the hand over the plate it just left, and
-        the overhead camera then sees the forearm instead of the plate -- the next round would
-        start blind. The bowl's move is a world edit by the round driver, so the belief is told to
-        start over rather than being left to decide on its own that a bowl teleported."""
+        Parking first is not cosmetic: a round ends with a hand over the object it just placed, and
+        the overhead camera then sees a forearm instead of the tabletop -- the next round would
+        start blind. The objects' moves are world edits by the round driver, so the belief is told
+        to start over rather than being left to decide on its own that they teleported."""
         from steward.assets.cobot import HOME
 
         try:
             # Command the park and let physics settle rather than waiting for a skill to converge:
-            # the point is only to get the forearm out of the overhead camera's way, and the next
+            # the point is only to get the forearms out of the overhead camera's way, and the next
             # motion re-seeds its IK from the encoders anyway.
-            sim.command(robot_id, {"joints": dict(zip(skills.ik.joint_names("L"), HOME, strict=True))})
+            for arm in ("L", "R"):
+                sim.command(robot_id, {"joints": dict(zip(skills.ik.joint_names(arm), HOME, strict=True))})
+            for entity_id, at in homes.items():
+                sim.edit_move(entity_id, {"at": {"x": at[0], "y": at[1], "z": at[2]}})
             sim.step_seconds(1.2)
-            sim.edit_move("w:bowl-1", {"at": {"x": bowl_home[0], "y": bowl_home[1], "z": bowl_home[2]}})
         except Exception as exc:  # noqa: BLE001 - a stuck reset must not end the loop
             print(json.dumps({"reset": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False), flush=True)
             return
@@ -358,12 +378,13 @@ def cmd_cobot(args) -> int:
 
     def run_sensed_mission() -> None:
         rounds = args.rounds
+        mission = nest_bowls if args.task == "nest-bowls" else bowl_onto_plate
         done, crashes = 0, 0
         while True:
             try:
-                result = bowl_onto_plate(est, skills, sensed_frame, rgbd=rgbd)
+                result = mission(est, skills, sensed_frame, rgbd=rgbd)
                 outcome.update(result)
-                print(json.dumps({"mission": "bowl-on-plate", "round": done + 1, **result},
+                print(json.dumps({"mission": args.task, "round": done + 1, **result},
                                  ensure_ascii=False), flush=True)
             except Exception as exc:  # noqa: BLE001 - reported to the operator, console stays up
                 crashes += 1
@@ -581,11 +602,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("build-kitchen").set_defaults(fn=cmd_build_kitchen)
     sub.add_parser("build-cobot").set_defaults(fn=cmd_build_cobot)
-    defaults = {"demo": "phase0-kitchen", "shuttle": "phase0-shuttle", "cobot": "cobot-table"}
+    sub.add_parser("build-cobot-kitchen").set_defaults(fn=cmd_build_cobot_kitchen)
+    defaults = {"demo": "phase0-kitchen", "shuttle": "phase0-shuttle"}
     for name, fn in (("world", cmd_world), ("up", cmd_up), ("demo", cmd_demo), ("shuttle", cmd_shuttle),
                      ("chores", cmd_chores), ("cobot", cmd_cobot)):
         p = sub.add_parser(name)
-        p.add_argument("--scenario", default=defaults.get(name, "phase0-chores"))
+        # A cobot run picks its scenario from its task, so it has no fixed default here.
+        p.add_argument("--scenario", default=None if name == "cobot" else defaults.get(name, "phase0-chores"))
         in_process = name in ("demo", "shuttle", "chores", "cobot")
         p.add_argument("--speed", type=float, default=4.0 if in_process else 1.0)
         p.add_argument("--seed", type=int, default=0)
@@ -615,6 +638,9 @@ def main(argv: list[str] | None = None) -> int:
         if name == "shuttle":
             p.add_argument("--steps", type=int, default=6, help="number of moves; 0 repeats until Ctrl-C")
         if name == "cobot":
+            p.add_argument("--task", choices=("bowl-on-plate", "nest-bowls"), default="bowl-on-plate",
+                           help="what the twin does in the scene: bowl onto the plate, or nest the three "
+                                "coloured bowls of the kitchen (the cobot-kitchen scenario)")
             p.add_argument("--ground-truth", action="store_true",
                            help="aim the skills at true object poses instead of the robot's estimates (debugging)")
             p.add_argument("--rounds", type=int, default=0,

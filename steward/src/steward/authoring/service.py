@@ -349,14 +349,51 @@ def cobot_spec() -> dict:
 COBOT_TASK = "把碗搬到盘子上；一次只用一个夹爪，搬完再回到停放姿态。"
 
 
-def build_default_kitchen(service: AuthoringService) -> dict:
-    """Generate, validate and publish the kitchen assets, compose the scene and save the scenario."""
+def cobot_kitchen_spec() -> dict:
+    """The chores kitchen's tableware on one table in front of the twin.
+
+    The same three nesting bowls (30, 20 and 12 cm), wine glass and black mug as the chores
+    kitchen, with the table placed where a fixed dual arm can work instead of a mobile base. The
+    largest bowl sits on the centre line, which is the one strip both arms can reach, so either
+    arm can nest into it; each smaller bowl stands on the side of the arm that will carry it.
+    Positions are measured against the twin's reachable tabletop map, not guessed: the near band
+    (x 0.10-0.30) holds a strictly vertical tool, and the outer band (x to 0.60) needs a tilt.
+    """
+    return {
+        "name": "cobot-kitchen",
+        "entities": [
+            {"id": "w:room", "asset": "kitchen-room", "at": {"x": 0.0, "y": 0.0}},
+            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
+            {"id": "w:table-1", "asset": "cobot-kitchen-table", "at": {"x": 0.50, "y": 0.0}},
+            # Largest bowl on the centre line (both arms), the other two within one arm each.
+            {"id": "w:bowl-red", "asset": "bowl-red-large", "on": "w:table-1", "offset": [-0.18, 0.00]},
+            {"id": "w:bowl-green", "asset": "bowl-green-medium", "on": "w:table-1", "offset": [-0.20, 0.28]},
+            {"id": "w:bowl-blue", "asset": "bowl-blue-small", "on": "w:table-1", "offset": [-0.32, -0.28]},
+            {"id": "w:wine-glass", "asset": "wine-glass", "on": "w:table-1", "offset": [0.00, 0.28]},
+            {"id": "w:mug", "asset": "black-mug", "on": "w:table-1", "offset": [0.02, -0.12]},
+        ],
+        "regions": [{"id": "kitchen", "label": "kitchen", "polygon": [[-3, -2.5], [3, -2.5], [3, 2.5], [-3, 2.5]]}],
+    }
+
+
+COBOT_KITCHEN_TASK = "把桌上三个颜色不同的碗按大小叠起来；高脚杯和咖啡杯留在桌上。"
+
+
+def _publish_assets(service: AuthoringService, assets: dict[str, tuple[str, dict]]) -> dict[str, str]:
+    """Generate, validate and publish a set of generated assets."""
     published = {}
-    for name, (generator, params) in KITCHEN_ASSETS.items():
+    for name, (generator, params) in assets.items():
         created = service.create_asset(generator=generator, params=params)
         if not created["validation"]["ok"]:
             raise AuthoringError(f"generated asset {name} failed validation: {created['validation']['errors']}")
-        published[name] = service.publish_asset(name, created["template"], meta={"generator": generator, "params": params})
+        published[name] = service.publish_asset(name, created["template"],
+                                                meta={"generator": generator, "params": params})
+    return published
+
+
+def build_default_kitchen(service: AuthoringService) -> dict:
+    """Generate, validate and publish the kitchen assets, compose the scene and save the scenario."""
+    published = _publish_assets(service, KITCHEN_ASSETS)
     scene = service.compose_scene(kitchen_spec())
     scenario = service.save_scenario({
         "name": "phase0-kitchen",
@@ -396,13 +433,7 @@ def build_cobot_workstation(service: AuthoringService) -> dict:
         "bowl": KITCHEN_ASSETS["bowl"],
         "plate": KITCHEN_ASSETS["plate"],
     }
-    published = {}
-    for name, (generator, params) in assets.items():
-        created = service.create_asset(generator=generator, params=params)
-        if not created["validation"]["ok"]:
-            raise AuthoringError(f"generated asset {name} failed validation: {created['validation']['errors']}")
-        published[name] = service.publish_asset(name, created["template"],
-                                                meta={"generator": generator, "params": params})
+    published = _publish_assets(service, assets)
     scene = service.compose_scene(cobot_spec())
     scenario = service.save_scenario({
         "name": "cobot-table",
@@ -412,5 +443,34 @@ def build_cobot_workstation(service: AuthoringService) -> dict:
         # Frame the console on the workstation: both arms and both pieces of tableware fill the
         # view, which is the only way a three-centimetre grasp is visible on the Ego-State panel.
         "view": {"lookat": [0.30, 0.14, 0.80], "distance": 1.9, "azimuth": 90.0, "elevation": -35.0},
+    })
+    return {"assets": {k: v["version"][:12] for k, v in published.items()}, "scene": scene, "scenario": scenario}
+
+
+def build_cobot_kitchen(service: AuthoringService) -> dict:
+    """Put the twin in the chores kitchen: the coloured bowls on one table within its reach."""
+    from steward.assets.cobot import cobot_magic
+
+    GENERATORS.setdefault("cobot_magic", cobot_magic)
+    assets = {
+        "kitchen-room": KITCHEN_ASSETS["kitchen-room"],
+        "cobot-magic": ("cobot_magic", {}),
+        "cobot-kitchen-table": ("dining_table", {"width": 0.9, "depth": 1.0}),
+        "bowl-red-large": KITCHEN_ASSETS["bowl-red-large"],
+        "bowl-green-medium": KITCHEN_ASSETS["bowl-green-medium"],
+        "bowl-blue-small": KITCHEN_ASSETS["bowl-blue-small"],
+        "wine-glass": KITCHEN_ASSETS["wine-glass"],
+        "black-mug": KITCHEN_ASSETS["black-mug"],
+    }
+    published = _publish_assets(service, assets)
+    scene = service.compose_scene(cobot_kitchen_spec())
+    scenario = service.save_scenario({
+        "name": "cobot-kitchen",
+        "scene": "cobot-kitchen",
+        "robots": ["w:cobot-1"],
+        "task": COBOT_KITCHEN_TASK,
+        # Frame the console on the twin and its table: the arms are 0.5 m tall and the grasp is
+        # 3 cm, which is invisible from the room-sized default.
+        "view": {"lookat": [0.32, 0.10, 0.80], "distance": 1.9, "azimuth": 90.0, "elevation": -35.0},
     })
     return {"assets": {k: v["version"][:12] for k, v in published.items()}, "scene": scene, "scenario": scenario}

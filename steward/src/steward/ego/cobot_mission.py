@@ -46,6 +46,18 @@ def perceive(est: EgoEstimator, frame: Callable[[], dict], frames: int = 8,
     header) instead of labelled detections: the robot then has to find and measure the objects
     itself, which is the whole point of the exercise.
     """
+    best: dict[str, Sighting] = {}
+    for sighting in sightings(est, frame, frames=frames, pause_s=pause_s, min_existence=min_existence,
+                              rgbd=rgbd):
+        if sighting.category not in best or sighting.existence > best[sighting.category].existence:
+            best[sighting.category] = sighting
+    return best
+
+
+def sightings(est: EgoEstimator, frame: Callable[[], dict], frames: int = 8,
+              pause_s: float = 0.02, min_existence: float = 0.4,
+              rgbd: bool = False) -> list[Sighting]:
+    """Like :func:`perceive`, but one entry per object: a table with three bowls needs all three."""
     before = {track_id: track.last_seen for track_id, track in est.tracks.items()}
     for _ in range(frames):
         payload = frame()
@@ -55,20 +67,18 @@ def perceive(est: EgoEstimator, frame: Callable[[], dict], frames: int = 8,
             est.update(payload)
         if pause_s:
             time.sleep(pause_s)
-    best: dict[str, Sighting] = {}
+    seen: list[Sighting] = []
+    cam = est.camera_pose()
     for track in est.tracks.values():
         if not track.category_counts or track.existence < min_existence:
             continue
         if before.get(track.id) == track.last_seen:
             continue
-        category = max(track.category_counts, key=track.category_counts.get)
-        cam = est.camera_pose()
-        sighting = Sighting(track_id=track.id, category=category, pos=np.array(track.pos, dtype=float),
-                            size=np.array(track.size, dtype=float), existence=float(track.existence),
-                            range_m=float(np.linalg.norm(sighting_distance(track.pos, cam))))
-        if category not in best or sighting.existence > best[category].existence:
-            best[category] = sighting
-    return best
+        seen.append(Sighting(track_id=track.id, category=max(track.category_counts, key=track.category_counts.get),
+                             pos=np.array(track.pos, dtype=float), size=np.array(track.size, dtype=float),
+                             existence=float(track.existence),
+                             range_m=float(np.linalg.norm(sighting_distance(track.pos, cam)))))
+    return seen
 
 
 def sighting_distance(pos, cam_pose: dict) -> np.ndarray:
@@ -119,6 +129,79 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
             continue
         return {"ok": True, "attempts": attempt, "bowl": bowl.pos.tolist(), "plate": plate.pos.tolist(), "log": log}
     return {"ok": False, "log": log}
+
+
+def nest_bowls(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], dict],
+               retries: int = 2, rgbd: bool = False) -> dict:
+    """Look at the table, find the three nesting bowls, and stack them largest at the bottom.
+
+    Each bowl is carried by the arm on its own side of the table, and every one is put down on
+    the largest bowl's centre line — the one strip of the tabletop both arms can reach — so the
+    smaller bowl always ends up inside the larger one. The bowls are released a few centimetres
+    above the floor of the bowl below: a parallel gripper cannot lower a bowl into another bowl
+    without its fingers reaching the bottom first, and a real person lets go and lets it drop in.
+    """
+    log: list[str] = []
+    for attempt in range(1, retries + 1):
+        seen = sightings(est, frame, frames=10 if rgbd else 8, rgbd=rgbd)
+        bowls = sorted((s for s in seen if s.category == "bowl"), key=lambda s: -_footprint(s))
+        if len(bowls) < 3:
+            log.append(f"attempt {attempt}: only {len(bowls)} bowl(s) in view, the table has three")
+            _park_both(skills, log)
+            continue
+        log.append(f"attempt {attempt}: bowls " + "; ".join(f"{_fmt(b.pos)} {_footprint(b) * 1e4:.0f} cm2"
+                                                           for b in bowls))
+        base, grip, placed = bowls[0], None, []
+        try:
+            for small in bowls[1:]:
+                arm, grip = _arm_for(float(small.pos[1]))
+                floor = _inner_floor(base)
+                rest = floor + 0.5 * _extent(small.size, 2, 0.05)
+                target = [float(base.pos[0]), float(base.pos[1]), rest + _NEST_DROP]
+                _run(skills, "pick", {"arm": arm, "gripper": grip, "at": [float(v) for v in small.pos]}, log)
+                _run(skills, "place", {"arm": arm, "gripper": grip, "at": target}, log)
+                placed.append(small.track_id)
+                # After it drops, the bowl rests on the floor it was released over.
+                base = Sighting(track_id=small.track_id, category=small.category,
+                                pos=np.array([target[0], target[1], rest]), size=small.size,
+                                existence=small.existence, range_m=small.range_m)
+        except SkillStopped:
+            raise
+        except SkillFailed as exc:
+            log.append(f"attempt {attempt} failed: {exc}")
+            if grip is not None and _holding(skills, grip):
+                _run(skills, "open", {"gripper": grip}, log)
+                log.append(f"attempt {attempt}: put the bowl down where it was held")
+            _park_both(skills, log)
+            continue
+        return {"ok": True, "attempts": attempt, "base": bowls[0].track_id, "nested": placed,
+                "top": round(float(base.pos[2]), 4), "log": log}
+    return {"ok": False, "log": log}
+
+
+# A nesting bowl's inner floor: the 8 mm base disc plus the 2 mm the wall segments are lifted by.
+_BOWL_FLOOR = 0.010
+# Released this far above the floor of the bowl below; see the docstring of nest_bowls.
+_NEST_DROP = 0.030
+
+
+def _inner_floor(base: Sighting) -> float:
+    """Where the next bowl comes to rest: the base bowl's own floor, measured from its pose."""
+    return float(base.pos[2]) - 0.5 * _extent(base.size, 2, 0.06) + _BOWL_FLOOR
+
+
+def _footprint(sighting: Sighting) -> float:
+    return float(sighting.size[0]) * float(sighting.size[1]) if len(sighting.size) > 1 else 0.0
+
+
+def _arm_for(y: float) -> tuple[str, str]:
+    """The arm that works the side of the table ``y`` is on: the twin's arms are 0.62 m apart."""
+    return ("L", "L_link6") if y >= 0.0 else ("R", "R_link6")
+
+
+def _park_both(skills: CobotSkills, log: list[str]) -> None:
+    for grip in ("L_link6", "R_link6"):
+        _park(skills, grip, log)
 
 
 def _park(skills: CobotSkills, grip: str, log: list[str]) -> None:
