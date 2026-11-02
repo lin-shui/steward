@@ -137,6 +137,8 @@ class CobotSkills:
                 self.place(job, plan)
             elif skill == "push":
                 self.push(job, plan)
+            elif skill == "drawer":
+                self.drawer(job, plan)
             elif skill == "navigate":
                 self.navigate(job, plan)
             elif skill == "lift":
@@ -233,6 +235,45 @@ class CobotSkills:
         tool = _tool_sideways(plan.get("direction", [1.0, 0.0, 0.0]))
         self.move_to(job, arm, start, tool)
         self.move_to(job, arm, [start[i] + travel[i] for i in range(3)], tool, line=True)
+
+    def drawer(self, job: Job, plan: dict) -> None:
+        """Grasp a drawer handle and pull it along its slide, or push it shut.
+
+        ``plan``: ``handle`` is the pinch point on the handle, ``axis`` the direction the drawer
+        travels when it opens (world), ``travel`` the metres to move (negative closes it), and
+        ``gripper``. The world makes a grasped drawer follow the pinch point on a PD force along
+        its slide, so moving the arm is what moves the drawer -- and the job reports the travel
+        it was asked for, while the caller checks the drawer itself in World State.
+        """
+        grip = plan.get("gripper") or plan.get("grip") or "R_link6"
+        arm = ARM_OF_GRIPPER.get(grip)
+        if arm is None:
+            raise SkillFailed(f"unknown gripper {grip!r}; expected one of {sorted(ARM_OF_GRIPPER)}")
+        handle = _xyz(plan["handle"], "plan.handle")
+        axis = _xyz(plan["axis"], "plan.axis")
+        travel = float(plan["travel"])
+        tool = _tool_down()
+        if (self._state().get("grippers") or {}).get(grip, {}).get("state") != "open":
+            self.gripper(job, grip, close=False)
+        above = [handle[0], handle[1], handle[2] + self.config.approach_height]
+        self.move_to(job, arm, above, tool)
+        self.move_to(job, arm, handle, tool, line=True)
+        self.gripper(job, grip, close=True)
+        if not (self._state().get("grippers") or {}).get(grip, {}).get("holdingHandle"):
+            self.gripper(job, grip, close=False)
+            self.move_to(job, arm, above, tool, line=True)
+            raise SkillFailed(f"closed at {_fmt(handle)} but no drawer handle was between the fingers")
+        job.log.append(f"grasped the handle at {_fmt(handle)}")
+        here = self.tcp(arm)
+        steps = max(1, int(abs(travel) / 0.03))
+        for i in range(1, steps + 1):
+            point = [here[j] + axis[j] * travel * i / steps for j in range(3)]
+            self.move_to(job, arm, point, tool)
+        self.gripper(job, grip, close=False)
+        end = [here[j] + axis[j] * travel for j in range(3)]
+        self.move_to(job, arm, [end[0], end[1], end[2] + self.config.retreat_height], tool, line=True)
+        verb = "opened" if travel >= 0 else "closed"
+        job.message = f"{verb} the drawer by {abs(travel) * 100:.0f} cm"
 
     def gripper(self, job: Job, grip: str, close: bool) -> None:
         if grip not in ARM_OF_GRIPPER:
