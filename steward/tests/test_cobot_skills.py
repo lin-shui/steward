@@ -8,11 +8,11 @@ from steward.assets.generators import bowl, building, dining_table, plate
 from steward.ego.cobot_skills import CobotSkills, MotionConfig
 from steward.world.sim import WorldSim
 
-# The left arm's comfortable tabletop band, measured by scanning tool-down IK against the URDF:
-# grasp points are reachable with a strictly vertical tool at x <= ~0.30, y >= ~0.15.
+# The left arm's tabletop band on the mobile twin, measured by scanning tool-down IK: the chassis
+# front is at x = 0.34, and the arm reaches x 0.38-0.60 at y +-0.25 (y = 0 sits between the arms).
 TABLE_TOP = 0.75
-BOWL_AT = [0.28, 0.32, TABLE_TOP]
-PLATE_AT = [0.30, 0.10, TABLE_TOP]  # inside the reachable band the wrist can hold vertically
+BOWL_AT = [0.40, 0.20, TABLE_TOP]
+PLATE_AT = [0.62, 0.20, TABLE_TOP]
 
 
 def _scene() -> dict:
@@ -22,9 +22,9 @@ def _scene() -> dict:
     robot = cobot_magic().to_dict()
     robot["id"] = "w:cobot"
 
-    table = dining_table(width=0.7, depth=0.8, height=TABLE_TOP).to_dict()
+    table = dining_table(width=1.2, depth=0.9, height=TABLE_TOP).to_dict()
     table["id"] = "w:table"
-    table["pose"]["value"]["p"] = [0.45, 0.0, 0.0]
+    table["pose"]["value"]["p"] = [0.92, 0.0, 0.0]
 
     dish = bowl().to_dict()
     dish["id"] = "w:bowl-1"
@@ -74,7 +74,8 @@ def test_pick_and_place_moves_the_object(rig) -> None:
     assert any(e["type"] == "grasp/attach" for e in sim.events), "the gripper closed on nothing"
 
     carried = skills.tcp("L")
-    target = [carried[0] - 0.08, carried[1] + 0.10, carried[2] - skills.config.retreat_height]
+    # Forward along the arm's own line: everything behind the chassis front is out of reach now.
+    target = [carried[0] + 0.10, carried[1], carried[2] - skills.config.retreat_height]
     job = skills.start("place", {"id": "r2", "plan": {"arm": "L", "at": target}})
     done = skills.wait(job.id, timeout=90)
     assert done.state == "succeeded", f"place failed: {done.message}\n" + "\n".join(done.log)
@@ -129,3 +130,38 @@ def test_park_verb_returns_the_arm_to_the_rest_posture(rig) -> None:
     joints = sim.sensors("w:cobot")["joints"]
     for name, value in zip(skills.ik.joint_names("L"), HOME, strict=True):
         assert joints[name] == pytest.approx(value, abs=0.06)
+
+
+def test_the_base_drives_to_a_waypoint_and_turns() -> None:
+    """The mobile half of the twin: the chassis goes where it is told and says so in odometry.
+
+    An empty room on purpose: turning in place beside a table sweeps the arms through it, which is
+    the body's real constraint and belongs in a docking test, not in a chassis test."""
+    from steward.assets.generators import building
+
+    room = building(width=4.0, depth=4.0, height=2.6).to_dict()
+    room["id"] = "w:room"
+    robot = cobot_magic().to_dict()
+    robot["id"] = "w:cobot"
+    sim = WorldSim({"mode": "world", "entities": [room, robot]})
+    sim.start()
+    skills = CobotSkills(command=lambda cmd: sim.command("w:cobot", cmd),
+                         state=lambda: sim.sensors("w:cobot"),
+                         config=MotionConfig(tick_s=0.01))
+    try:
+        job = skills.start("navigate", {"id": "r5", "plan": {"at": [-0.35, 0.20, 0.6]}})
+        done = skills.wait(job.id, timeout=90)
+        assert done.state == "succeeded", f"{done.message}\n" + "\n".join(done.log)
+        o = sim.sensors("w:cobot")["odometry"]
+        assert np.hypot(o["x"] + 0.35, o["y"] - 0.20) < 0.05
+        assert abs(o["yaw"] - 0.6) < 0.06
+    finally:
+        sim.stop()
+
+
+def test_the_torso_rises_to_a_requested_height(rig) -> None:
+    sim, skills = rig
+    job = skills.start("lift", {"id": "r6", "plan": {"height": 0.95}})
+    done = skills.wait(job.id, timeout=60)
+    assert done.state == "succeeded", f"{done.message}\n" + "\n".join(done.log)
+    assert sim.sensors("w:cobot")["joints"]["lift"] == pytest.approx(0.95, abs=0.02)

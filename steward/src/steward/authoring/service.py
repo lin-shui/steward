@@ -358,17 +358,22 @@ KITCHEN_ASSETS = {
 
 
 def cobot_spec() -> dict:
-    """The Cobot Magic workstation: one tabletop in front of the twin, a bowl and a plate on it."""
+    """The Cobot Magic workstation: the twin parked at a tabletop, a bowl and a plate on it.
+
+    The table's near edge sits at x = 0.38, just in front of the chassis (half-length 0.34), so
+    the twin works the band its arms can reach over the edge (measured: x 0.38-0.60 at y +-0.25,
+    strictly vertical only in the nearest part of it).
+    """
     return {
         "name": "cobot-table",
         "entities": [
             {"id": "w:room", "asset": "cobot-room", "at": {"x": 0.0, "y": 0.0}},
-            {"id": "w:table-1", "asset": "cobot-table", "at": {"x": 0.45, "y": 0.0}},
+            {"id": "w:table-1", "asset": "cobot-table", "at": {"x": 0.85, "y": 0.0}},
             {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
-            # Table centre is (0.45, 0); these land the tableware in the left arm's reachable band,
+            # Table centre is (0.85, 0); these land the tableware in the left arm's reachable band,
             # where a strictly vertical tool can still descend (see tests/test_cobot_skills.py).
-            {"id": "w:bowl-1", "asset": "bowl", "on": "w:table-1", "offset": [-0.17, 0.32]},
-            {"id": "w:plate-1", "asset": "plate", "on": "w:table-1", "offset": [-0.15, 0.10]},
+            {"id": "w:bowl-1", "asset": "bowl", "on": "w:table-1", "offset": [-0.39, 0.20]},
+            {"id": "w:plate-1", "asset": "plate", "on": "w:table-1", "offset": [-0.27, -0.22]},
         ],
         "regions": [{"id": "workcell", "label": "workcell", "polygon": [[-2, -2], [2, -2], [2, 2], [-2, 2]]}],
     }
@@ -378,27 +383,32 @@ COBOT_TASK = "把碗搬到盘子上；一次只用一个夹爪，搬完再回到
 
 
 def cobot_kitchen_spec() -> dict:
-    """The chores kitchen's tableware on one table in front of the twin.
+    """The chores kitchen's tableware on one table the twin is parked at.
 
     The same three nesting bowls (30, 20 and 12 cm), wine glass and black mug as the chores
-    kitchen, with the table placed where a fixed dual arm can work instead of a mobile base. The
-    largest bowl sits on the centre line, which is the one strip both arms can reach, so either
-    arm can nest into it; each smaller bowl stands on the side of the arm that will carry it.
-    Positions are measured against the twin's reachable tabletop map, not guessed: the near band
-    (x 0.10-0.30) holds a strictly vertical tool, and the outer band (x to 0.60) needs a tilt.
+    kitchen. The table's near edge sits at x = 0.38, just in front of the chassis; every piece
+    stands in the strip the arms reach over that edge (measured: x 0.38-0.60, and y +-0.25 puts a
+    piece in front of one arm rather than between both). The largest bowl stands on the left
+    arm's line because stacking happens along that line, the other two on the arms that carry
+    them.
     """
     return {
         "name": "cobot-kitchen",
         "entities": [
             {"id": "w:room", "asset": "kitchen-room", "at": {"x": 0.0, "y": 0.0}},
             {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
-            {"id": "w:table-1", "asset": "cobot-kitchen-table", "at": {"x": 0.50, "y": 0.0}},
-            # Largest bowl on the centre line (both arms), the other two within one arm each.
-            {"id": "w:bowl-red", "asset": "bowl-red-large", "on": "w:table-1", "offset": [-0.18, 0.00]},
-            {"id": "w:bowl-green", "asset": "bowl-green-medium", "on": "w:table-1", "offset": [-0.20, 0.28]},
-            {"id": "w:bowl-blue", "asset": "bowl-blue-small", "on": "w:table-1", "offset": [-0.32, -0.28]},
-            {"id": "w:wine-glass", "asset": "wine-glass", "on": "w:table-1", "offset": [0.00, 0.28]},
-            {"id": "w:mug", "asset": "black-mug", "on": "w:table-1", "offset": [0.02, -0.12]},
+            {"id": "w:table-1", "asset": "cobot-kitchen-table", "at": {"x": 0.90, "y": 0.0}},
+            # Every piece is fully on the tabletop (near edge x = 0.35) and inside the strip the
+            # arms reach over it (x 0.40-0.60): a cylinder resting on one contact point tips.
+            # The largest bowl is the stack point and both arms reach it; the others sit on their
+            # own arm's side, spaced by their radii.
+            {"id": "w:bowl-red", "asset": "bowl-red-large", "on": "w:table-1", "offset": [-0.42, 0.00]},
+            {"id": "w:bowl-green", "asset": "bowl-green-medium", "on": "w:table-1", "offset": [-0.45, 0.38]},
+            {"id": "w:bowl-blue", "asset": "bowl-blue-small", "on": "w:table-1", "offset": [-0.44, -0.28]},
+            # The glass and the mug are left alone by this task: they stand on the far half, out of
+            # the arms' strip but inside the overhead camera's view.
+            {"id": "w:wine-glass", "asset": "wine-glass", "on": "w:table-1", "offset": [0.20, -0.30]},
+            {"id": "w:mug", "asset": "black-mug", "on": "w:table-1", "offset": [0.20, 0.30]},
         ],
         "regions": [{"id": "kitchen", "label": "kitchen", "polygon": [[-3, -2.5], [3, -2.5], [3, 2.5], [-3, 2.5]]}],
     }
@@ -459,7 +469,7 @@ def build_cobot_workstation(service: AuthoringService) -> dict:
     GENERATORS.setdefault("cobot_magic", cobot_magic)
     assets = {
         "cobot-room": ("building", {"width": 4.0, "depth": 4.0, "height": 2.6}),
-        "cobot-table": ("dining_table", {"width": 0.7, "depth": 0.8}),
+        "cobot-table": ("dining_table", {"width": 1.0, "depth": 0.9}),
         "cobot-magic": ("cobot_magic", {}),
         "bowl": KITCHEN_ASSETS["bowl"],
         "plate": KITCHEN_ASSETS["plate"],
@@ -490,7 +500,7 @@ def build_cobot_kitchen(service: AuthoringService) -> dict:
         "cobot-magic": ("cobot_magic", {}),
         # 0.8 x 0.8 under the overhead camera's cone: the whole top has to be inside the frame,
         # or the table never becomes a track (see assets/cobot.py's top_camera note).
-        "cobot-kitchen-table": ("dining_table", {"width": 0.8, "depth": 0.8}),
+        "cobot-kitchen-table": ("dining_table", {"width": 1.2, "depth": 1.0}),
         "bowl-red-large": KITCHEN_ASSETS["bowl-red-large"],
         "bowl-green-medium": KITCHEN_ASSETS["bowl-green-medium"],
         "bowl-blue-small": KITCHEN_ASSETS["bowl-blue-small"],

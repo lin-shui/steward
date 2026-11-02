@@ -30,7 +30,6 @@ import mink
 ARMS = ("L", "R")
 _ENT = "w:robot"  # entity id used to compile the robot-only model; MJCF names are prefixed with it
 _DOF_PER_ARM = 6
-_FINGER_JOINTS = ("joint7", "joint8")
 
 # Tool poses tried when the requested one is out of the wrist's range: turns about the tool's own
 # axis (they move the wrist, not the pinch point), then tilts from a ring of directions.
@@ -54,9 +53,16 @@ class CobotIK:
         build = build_mjcf(SceneState(mode="world", entities=[_as_entity(ent)]), timestep=timestep)
         self.model = build.compile()
         self.data = mink.Configuration(self.model)
-        # mink starts from a zero posture; the twin starts from the URDF's home, and FK must agree
-        # with the simulation before the first solve.
-        self.data.update(np.asarray(self.model.qpos0, dtype=float))
+        # MuJoCo's qpos0 is the zero posture, not the robot's posture: the lift's legal range does
+        # not even contain zero, so a solver seeded from qpos0 stands outside its own limits and
+        # every QP is infeasible. Seed from what the model was built with instead -- chassis pose
+        # from the entity, arms at their home posture, torso at its home height.
+        q = np.array(self.model.qpos0, dtype=float)
+        for jname, values in build.initial_qpos.items():
+            adr = int(self.model.jnt_qposadr[_joint_id(self.model, jname)])
+            for offset, value in enumerate(values):
+                q[adr + offset] = float(value)
+        self.data.update(q)
         self.dt = timestep
         self._arms = {}
         for arm in ARMS:
@@ -76,19 +82,43 @@ class CobotIK:
                 "limits": [(float(self.model.jnt_range[_joint_id(self.model, n)][0]),
                             float(self.model.jnt_range[_joint_id(self.model, n)][1])) for n in names],
             }
-        # Every DOF that is not part of a solved arm is frozen (other arm, both fingers).
+        # Every DOF that is not part of a solved arm is frozen: the base's x, y and yaw, the lift,
+        # the other arm and both fingers. Freezing the base matters as much as freeing the arm --
+        # an IK that may drive the chassis can "reach" any table by walking the robot there.
+        all_dofs = [int(self.model.jnt_dofadr[j]) for j in range(self.model.njnt)]
         self._freeze = {}
         for arm in ARMS:
-            frozen = [d for other in ARMS if other != arm for d in self._arms[other]["dofadr"]]
-            frozen += [int(self.model.jnt_dofadr[_joint_id(self.model, f"{_ENT}::{a}_{j}")])
-                       for a in ARMS for j in _FINGER_JOINTS]
-            self._freeze[arm] = mink.DofFreezingTask(self.model, dof_indices=frozen)
+            owned = set(self._arms[arm]["dofadr"])
+            self._freeze[arm] = mink.DofFreezingTask(
+                self.model, dof_indices=[d for d in all_dofs if d not in owned])
         self._posture = mink.PostureTask(self.model, cost=1e-2)
         self._limit = mink.ConfigurationLimit(self.model)
 
     # ------------------------------------------------------------------ queries
     def joint_names(self, arm: str) -> list[str]:
         return list(self._arms[self._check(arm)]["joints"])
+
+    def set_base(self, x: float = 0.0, y: float = 0.0, yaw: float = 0.0,
+                 lift: float | None = None) -> None:
+        """Place the model where the robot is: the chassis pose and the torso height.
+
+        Targets are then given in the world frame, as everything the robot acts on is. A solver
+        whose root stayed at the origin would be solving for a robot that never drove.
+        """
+        q = np.array(self.data.q, dtype=float)
+        for name, value in (("root_x", x), ("root_y", y), ("root_yaw", yaw), ("lift", lift)):
+            if name == "lift" and value is None:
+                continue
+            try:
+                jid = _joint_id(self.model, f"{_ENT}::{name}")
+            except KeyError:  # a fixed-root model has no chassis joints
+                continue
+            value = float(value)
+            lo, hi = self.model.jnt_range[jid]
+            if self.model.jnt_limited[jid]:
+                value = float(min(max(value, lo), hi))
+            q[self.model.jnt_qposadr[jid]] = value
+        self.data.update(q)
 
     def joint_limits(self, arm: str) -> list[tuple[float, float]]:
         return list(self._arms[self._check(arm)]["limits"])
@@ -103,11 +133,18 @@ class CobotIK:
         return [float(q[a]) for a in spec["qadr"]]
 
     def set_joints(self, arm: str, joints: list[float]) -> None:
-        """Seed the solver from measured joint angles (the robot's encoders, not a past solution)."""
+        """Seed the solver from measured joint angles (the robot's encoders, not a past solution).
+
+        Measured values are clamped to the URDF ranges. A servo holding against a hard stop
+        reports a few ten-thousandths of a radian past the limit, and mink's limit constraint
+        reads the whole configuration, not just the arms being solved: one such value in the
+        *other* arm makes every solve infeasible (an arm resting on its stop blocked the other
+        arm's grasps in the kitchen stacking mission).
+        """
         spec = self._arms[self._check(arm)]
         _check_len(joints, _DOF_PER_ARM, f"{arm} arm joints")
         q = np.array(self.data.q, dtype=float)
-        for qadr, value in zip(spec["qadr"], joints, strict=True):
+        for qadr, value in zip(spec["qadr"], self._within_limits(arm, joints), strict=True):
             q[qadr] = value
         self.data.update(q)
 
@@ -136,8 +173,9 @@ class CobotIK:
         """
         arm = self._check(arm)
         spec = self._arms[arm]
-        start = self.current(arm) if q_init is None else list(q_init)
-        _check_len(start, _DOF_PER_ARM, f"{arm} arm seed")
+        if q_init is not None:
+            _check_len(q_init, _DOF_PER_ARM, f"{arm} arm seed")
+        start = self.current(arm) if q_init is None else self._within_limits(arm, q_init)
 
         q = np.array(self.data.q, dtype=float)
         for qadr, value in zip(spec["qadr"], start, strict=True):
@@ -228,6 +266,10 @@ class CobotIK:
                       f"orientation: {detail}")
 
     # ------------------------------------------------------------------ private
+    def _within_limits(self, arm: str, joints: list[float]) -> list[float]:
+        return [min(max(float(v), lo), hi)
+                for v, (lo, hi) in zip(joints, self._arms[arm]["limits"])]
+
     def _errors(self, arm: str, position: list[float], orientation: list[float] | None) -> tuple[float, float]:
         pose = self.data.get_transform_frame_to_world(self._arms[arm]["ee"], "body")
         err = float(np.linalg.norm(np.asarray(pose.translation()) - np.asarray(position)))

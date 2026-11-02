@@ -6,7 +6,7 @@ import mujoco
 import numpy as np
 import pytest
 
-from steward.assets.cobot import cobot_magic
+from steward.assets.cobot import LIFT_HOME, cobot_magic
 from steward.assets.generators import bowl
 from steward.scene.mjcf import build_mjcf
 from steward.scene.schema import SceneState
@@ -47,9 +47,9 @@ def test_compiles_and_steps() -> None:
     build = build_mjcf(SceneState(mode="world", entities=[cobot_magic()]), timestep=0.005)
     model = mujoco.MjModel.from_xml_string(build.xml)
     data = mujoco.MjData(model)
-    # 2 arms x (6 revolute + 2 prismatic fingers) joints and actuators; fixed root adds none.
-    assert model.njnt == 16
-    assert model.nu == 16
+    # Planar root (2 slides + hinge), the lift, and 2 arms x (6 revolute + 2 prismatic fingers).
+    assert model.njnt == 20
+    assert model.nu == 20
     # Top camera plus one wrist camera per arm.
     cam_names = {mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_CAMERA, i) for i in range(model.ncam)}
     assert any(n.endswith("top_camera") for n in cam_names)
@@ -59,7 +59,7 @@ def test_compiles_and_steps() -> None:
     for _ in range(200):
         mujoco.mj_step(model, data)
     assert np.isfinite(data.qpos).all()
-    assert data.qvel.shape == (16,)
+    assert data.qvel.shape == (20,)
 
 
 def _cobot_scene(bowl_at: list[float] | None = None) -> dict:
@@ -86,8 +86,10 @@ def test_sim_generic_joints_and_dual_gripper_grasp() -> None:
     assert "grasp/attach" in kinds, f"expected an attach, events: {sim.events}"
     sim.step(20)
     frame = sim.sensors("w:cobot")
-    # Fixed root: odometry stays at the origin (plus sensor noise); joints cover both arms.
+    # Parked at the scene's pose: odometry reads there (plus sensor noise); joints cover the
+    # chassis, the lift and both arms.
     assert abs(frame["odometry"]["x"]) < 0.01 and abs(frame["odometry"]["yaw"]) < 0.01
+    assert frame["joints"]["lift"] == pytest.approx(LIFT_HOME, abs=0.02)
     assert {"L_joint1", "L_joint7", "R_joint6", "R_joint8"} <= set(frame["joints"])
     assert set(frame["grippers"]) == {"L_link6", "R_link6"}
     assert "gripper" not in frame, "multi-gripper robots must not fake a single gripper field"

@@ -61,7 +61,8 @@ def test_mask_does_not_swallow_the_tableware(rig) -> None:
     est.update(sim.sensors("w:cobot"))
     pose, sensor = sim.camera_pose("w:cobot", "top_camera")
     mask = self_pixels(est.robot_model, est.link_pose, pose, sensor["intrinsics"])
-    for entity, where in (("w:bowl-1", (0.28, 0.25)), ("w:plate-1", (0.30, 0.02))):
+    for entity in ("w:bowl-1", "w:plate-1"):
+        where = sim.world_state() and next(e for e in sim.world_state()["entities"] if e["id"] == entity)["pose"]["value"]["p"][:2]
         uv, _ = project(np.asarray([[where[0], where[1], 0.78]]), camera_model(pose, sensor["intrinsics"]))
         u, v = int(round(uv[0][0])), int(round(uv[0][1]))
         assert not mask[v, u], f"{entity} falls inside the robot's self mask"

@@ -29,7 +29,7 @@ def test_fk_ik_round_trip_is_exact_at_a_reached_posture(ik: CobotIK) -> None:
 
 
 def test_ik_reaches_a_tabletop_point_and_stays_inside_the_urdf_limits(ik: CobotIK) -> None:
-    goal = [0.30, 0.20, 0.55]
+    goal = [0.45, 0.30, 0.78]
     solution = ik.solve("L", goal, q_init=ik.neutral("L"))
     assert len(solution) == 6
     assert np.linalg.norm(np.subtract(ik.fk("L", solution)["p"], goal)) < 5e-3
@@ -39,9 +39,9 @@ def test_ik_reaches_a_tabletop_point_and_stays_inside_the_urdf_limits(ik: CobotI
 
 def test_solving_one_arm_leaves_the_other_arm_untouched(ik: CobotIK) -> None:
     # Seed the left arm somewhere distinctive first, then solve the right arm.
-    ik.solve("L", [0.30, 0.20, 0.55], q_init=ik.neutral("L"))
+    ik.solve("L", [0.45, 0.30, 0.78], q_init=ik.neutral("L"))
     left_before = ik.current("L")
-    ik.solve("R", [0.30, -0.20, 0.55], q_init=ik.neutral("R"))
+    ik.solve("R", [0.45, -0.30, 0.78], q_init=ik.neutral("R"))
     assert ik.current("L") == pytest.approx(left_before)
 
 
@@ -54,11 +54,30 @@ def test_unreachable_goal_raises_with_the_distance_missed(ik: CobotIK) -> None:
 def test_orientation_constrained_solve_points_the_tool_down(ik: CobotIK) -> None:
     # Tool pointing straight down: -z of the world expressed in the link's own frame.
     down = [0.0, 0.7071068, 0.7071068, 0.0]  # wxyz: 180 deg about the (1, 1, 0) axis
-    goal = [0.32, 0.16, 0.60]
+    goal = [0.44, 0.28, 0.80]
     solution = ik.solve("L", goal, down, q_init=ik.neutral("L"))
     pose = ik.fk("L", solution)
     assert np.linalg.norm(np.subtract(pose["p"], goal)) < 5e-3
     assert abs(float(np.dot(pose["q"], down))) > 0.99
+
+
+def test_a_measured_joint_past_its_limit_does_not_block_the_other_arm(ik: CobotIK) -> None:
+    """An encoder on a hard stop reads a hair past the limit; that must not stop the other arm.
+
+    mink's limit constraint covers the whole configuration, so seeding the measured value verbatim
+    made the *other* arm's solve infeasible. Live, the right arm lost the blue bowl's grasp
+    whenever the left arm finished a place with its wrist roll against the stop.
+    """
+    from steward.assets.cobot import HOME
+
+    other = list(HOME)
+    other[4] = ik.joint_limits("L")[4][1] + 2e-4  # joint5, a few ten-thousandths past its stop
+    ik.set_joints("L", other)
+    ik.set_joints("R", list(HOME))
+    wrist, tool = _wrist_for([0.461, -0.278, 0.806], [0.0, 1.0, 0.0, 0.0])
+    joints, _ = ik.solve_tool("R", wrist, tool, max_tilt=0.7)
+    reached = _pinch_of(ik, "R", joints)
+    assert np.linalg.norm(np.subtract(reached, [0.461, -0.278, 0.806])) < 0.015, reached
 
 
 def test_bad_arguments_are_rejected(ik: CobotIK) -> None:
@@ -91,7 +110,7 @@ def test_tilted_tool_keeps_the_pinch_point_where_it_was_asked(ik: CobotIK) -> No
     the solver has to tilt, and before it compensated, the fingers landed ~5 cm away from the
     target while every report still read "at the target" -- a place that missed.
     """
-    pinch = [0.302, 0.101, 0.942]
+    pinch = [0.50, 0.10, 0.82]
     wrist, tool = _wrist_for(pinch, [0.0, 1.0, 0.0, 0.0])  # tool pointing down
     joints, tilt = ik.solve_tool("L", wrist, tool, max_tilt=0.7, q_init=ik.neutral("L"))
     assert tilt > 0.0, "this pose is expected to need a tilt (otherwise the case is not exercised)"

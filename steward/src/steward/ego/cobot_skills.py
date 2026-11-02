@@ -1,13 +1,19 @@
-"""Skills for the Cobot Magic twin: IK-driven arm motion, grasping and placement.
+"""Skills for the Cobot Magic twin: chassis driving, torso lift and IK-driven arm motion.
 
 The verbs here are the cobot's version of :mod:`steward.ego.skills` (which drives the mobile
 kitchen robot's base, lift and reach slide). Both expose the same ``start`` / ``wait`` / ``stop``
-job interface, so the Ego Runtime can drive either one.
+job interface, so the Ego Runtime can drive either one. The base verbs (:meth:`driving`,
+:meth:`navigate`) are the mobile robot's primitives, ported as they are: turn to a heading,
+translate to a point, with a stall detector; the twin adds IK-driven arm motion on top.
 
 Grasp geometry comes from the model, not from a constant: the pinch point is
 ``assets.cobot.TCP_OFFSET`` along link6's +z, so a grasp targets the pinch point and the IK
 target is that pose pulled back by the offset. That is why a 1 cm perception error costs 1 cm
 here instead of the mobile robot's 6 cm capture radius.
+
+Arm targets are world poses. The solver is told where the chassis is and how high the torso is
+before every solve (:meth:`_sync`), so driving somewhere and then reaching for something works in
+the same coordinates the belief uses.
 
 Grasping still uses the simulator's ideal attach (the finger joint closes and the world rigidly
 attaches what is between the fingers); :meth:`CobotSkills.pick` is what makes the approach and
@@ -17,14 +23,15 @@ retreat real.
 from __future__ import annotations
 
 import itertools
+import math
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from steward.assets.cobot import HOME, TCP_OFFSET
+from steward.assets.cobot import HOME, LIFT_RANGE, TCP_OFFSET
 from steward.ego.ik import CobotIK, IkError
-from steward.math3d import pose_compose, quat_from_axis_angle
+from steward.math3d import pose_compose, quat_from_axis_angle, wrap_angle
 
 ARM_OF_GRIPPER = {"L_link6": "L", "R_link6": "R"}
 
@@ -49,6 +56,12 @@ class MotionConfig:
     max_tool_tilt: float = 0.7     # rad the tool may tilt off the requested orientation (wrist limits)
     tcp_tolerance: float = 0.015   # a solved pose further than this from the pinch point is refused
     grasp_grip_wait_s: float = 0.4
+    # Chassis motion, the mobile robot's numbers: the TRACER is not faster in the twin.
+    linear_speed: float = 0.25     # m/s
+    angular_speed: float = 0.6     # rad/s
+    position_tol: float = 0.02     # m, waypoint
+    yaw_tol: float = 0.03          # rad
+    drive_stall_s: float = 2.0
 
 
 @dataclass
@@ -124,6 +137,10 @@ class CobotSkills:
                 self.place(job, plan)
             elif skill == "push":
                 self.push(job, plan)
+            elif skill == "navigate":
+                self.navigate(job, plan)
+            elif skill == "lift":
+                self.set_lift(job, plan)
             elif skill == "park":
                 self.park(job, plan)
             elif skill in ("open", "close"):
@@ -224,6 +241,102 @@ class CobotSkills:
         self._settle_fingers(close)
         job.log.append(f"{grip} {'closed' if close else 'opened'}")
 
+    # ------------------------------------------------------------- chassis verbs
+    def navigate(self, job: Job, plan: dict) -> None:
+        """Drive to ``plan['at']`` = [x, y, yaw] in the world, through ``plan['path']`` if given.
+
+        The path is a list of ``[x, y]`` waypoints ending at the goal; without one the base goes
+        straight there. It is the caller's job to have chosen a collision-free path -- the base
+        itself is a collider, so a bad plan shows up as a stall, which is reported as such.
+        """
+        at = _xyz(plan["at"], "plan.at")
+        path = [[float(p[0]), float(p[1])] for p in plan.get("path") or [[at[0], at[1]]]]
+        if not path:
+            path = [[at[0], at[1]]]
+        self._drive(job, path, at[2])
+        job.log.append(f"base at {_fmt(self.tcp_base())}")
+
+    def set_lift(self, job: Job, plan: dict) -> None:
+        """Set the torso height; ``plan['height']`` is the carriage height above the chassis top."""
+        height = float(plan["height"])
+        lo, hi = LIFT_RANGE
+        if not lo <= height <= hi:
+            raise SkillFailed(f"lift height {height:.2f} m is outside [{lo:.2f}, {hi:.2f}]")
+        self._command({"joints": {"lift": height}})
+        deadline = time.monotonic() + self.config.settle_timeout_s
+        while time.monotonic() < deadline:
+            self._tick()
+            now = self._state()["joints"].get("lift")
+            if now is not None and abs(now - height) < 0.01:
+                job.log.append(f"lift at {height:.2f} m")
+                return
+        raise SkillFailed(f"lift did not reach {height:.2f} m")
+
+    def tcp_base(self) -> list[float]:
+        o = self._state().get("odometry") or {}
+        return [float(o.get("x", 0.0)), float(o.get("y", 0.0)), float(o.get("yaw", 0.0))]
+
+    def _turn_to(self, yaw_target: float) -> None:
+        """Turn in place to ``yaw_target``, steering the position controller from measured odometry."""
+        st = self._state()
+        o = st["odometry"]
+        x, y, yaw0 = o["x"], o["y"], o["yaw"]
+        delta = wrap_angle(yaw_target - yaw0)
+        duration = abs(delta) / self.config.angular_speed
+        t0 = st["stamp"]
+        deadline = t0 + duration * 3.0 + 5.0
+        since_progress = {"t": t0, "err": None}
+        while True:
+            st = self._tick()
+            frac = 1.0 if duration == 0 else min(1.0, (st["stamp"] - t0) / duration)
+            self._command({"base": [x, y, yaw0 + delta * frac]})
+            err = abs(wrap_angle(yaw_target - st["odometry"]["yaw"]))
+            if frac >= 1.0 and err < self.config.yaw_tol:
+                return
+            if _stalled(st["stamp"], err, since_progress, self.config.drive_stall_s):
+                raise SkillFailed(f"turn is blocked: no progress for {self.config.drive_stall_s:.0f} s "
+                                  f"(yaw error {err:.2f} rad)")
+            if st["stamp"] > deadline:
+                raise SkillFailed(f"turn did not converge (yaw error {err:.2f} rad)")
+
+    def _translate_to(self, x1: float, y1: float, yaw: float) -> None:
+        """Drive straight to ``(x1, y1)`` holding ``yaw`` over the same path."""
+        st = self._state()
+        x0, y0 = st["odometry"]["x"], st["odometry"]["y"]
+        # The yaw joint is continuous: keep the heading in the odometry's unwrapped frame, or the
+        # position controller spins the base a whole turn.
+        current = st["odometry"]["yaw"]
+        yaw = current + wrap_angle(yaw - current)
+        length = math.hypot(x1 - x0, y1 - y0)
+        duration = length / self.config.linear_speed
+        t0 = st["stamp"]
+        deadline = t0 + duration * 3.0 + 5.0
+        since_progress = {"t": t0, "err": None}
+        while True:
+            st = self._tick()
+            frac = 1.0 if duration == 0 else min(1.0, (st["stamp"] - t0) / duration)
+            self._command({"base": [x0 + (x1 - x0) * frac, y0 + (y1 - y0) * frac, yaw]})
+            err = math.hypot(x1 - st["odometry"]["x"], y1 - st["odometry"]["y"])
+            if frac >= 1.0 and err < self.config.position_tol:
+                return
+            if _stalled(st["stamp"], err, since_progress, self.config.drive_stall_s):
+                raise SkillFailed(f"base is blocked {err:.2f} m from the waypoint "
+                                  f"({st['odometry']['x']:.2f}, {st['odometry']['y']:.2f}); no progress for "
+                                  f"{self.config.drive_stall_s:.0f} s")
+            if st["stamp"] > deadline:
+                raise SkillFailed(f"base did not reach the waypoint (error {err:.2f} m)")
+
+    def _drive(self, job: Job, path: list, final_yaw: float) -> None:
+        for wx, wy in path:
+            o = self._state()["odometry"]
+            if math.hypot(wx - o["x"], wy - o["y"]) < self.config.position_tol:
+                continue
+            heading = math.atan2(wy - o["y"], wx - o["x"])
+            self._turn_to(heading)
+            self._translate_to(wx, wy, heading)
+            job.log.append(f"reached waypoint ({wx:.2f}, {wy:.2f})")
+        self._turn_to(final_yaw)
+
     # -------------------------------------------------------------- primitives
     def move_to(self, job: Job, arm: str, tcp: list[float], orientation: list[float] | None = None,
                 line: bool = False) -> list[float]:
@@ -307,9 +420,15 @@ class CobotSkills:
         self._wait_joints(arm, target)
 
     def _sync(self, arm: str) -> None:
-        """Seed the solver from the robot's own encoders, not from the last solution."""
+        """Seed the solver from the robot's own encoders, not from the last solution.
+
+        The chassis pose and the torso height go in too: the arm solves toward world targets, so
+        the model the solver walks has to stand where the robot stands."""
         names = self.ik.joint_names(arm)
         st = self._state()
+        o = st.get("odometry") or {}
+        self.ik.set_base(float(o.get("x", 0.0)), float(o.get("y", 0.0)), float(o.get("yaw", 0.0)),
+                         st.get("joints", {}).get("lift"))
         if all(n in st.get("joints", {}) for n in names):
             self.ik.set_joints(arm, [st["joints"][n] for n in names])
 
@@ -317,15 +436,24 @@ class CobotSkills:
         names = self.ik.joint_names(arm)
         deadline = time.monotonic() + self.config.settle_timeout_s
         last, since = None, time.monotonic()
+        compensated = False
         while time.monotonic() < deadline:
             self._tick()
             now = [self._state()["joints"][n] for n in names]
             if max(abs(a - b) for a, b in zip(now, target, strict=True)) <= self.config.joint_tol:
                 return
-            # A joint that stops moving short of the target means the arm is blocked or the
-            # actuator is saturated: report it instead of burning the whole timeout.
+            # A joint that stops moving short of the target is either blocked or holding a load
+            # against gravity: a position servo settles with a steady-state error. If the residual
+            # is small, command the target plus that residual once -- integral action, which is
+            # what a real arm's servo loop does -- before calling it blocked.
             if last is not None and max(abs(a - b) for a, b in zip(now, last, strict=True)) < 1e-3:
                 if time.monotonic() - since > self.config.stall_s:
+                    residual = [t - n for t, n in zip(target, now, strict=True)]
+                    if not compensated and max(abs(r) for r in residual) < 0.1:
+                        self._command({"joints": dict(zip(names, [t + r for t, r in zip(target, residual, strict=True)],
+                                                         strict=True))})
+                        compensated, since, last = True, time.monotonic(), None
+                        continue
                     raise SkillFailed(f"{arm} arm stalled {_fmt(list(now))} toward {_fmt(target)}")
             else:
                 since = time.monotonic()
@@ -401,3 +529,15 @@ def _xyz(value, what: str) -> list[float]:
     if not isinstance(value, (list, tuple)) or len(value) != 3:
         raise SkillFailed(f"{what} must be [x, y, z], got {value!r}")
     return [float(v) for v in value]
+
+
+def _stalled(now: float, err: float, since: dict, window: float) -> bool:
+    """Whether ``err`` has stopped improving for ``window`` seconds of body time.
+
+    Progress means the error got smaller, not that it changed: during a turn the error ticks down
+    by millimetres per sample and a "did it change at all" test would call that blocked.
+    """
+    if since["err"] is None or err < since["err"] - 1e-4:
+        since["t"], since["err"] = now, err
+        return False
+    return now - since["t"] > window

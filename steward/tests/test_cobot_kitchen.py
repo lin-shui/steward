@@ -13,7 +13,7 @@ import pytest
 from steward.assets.cobot import cobot_magic
 from steward.authoring.service import AuthoringService, build_cobot_kitchen
 from steward.ego.cobot_mission import nest_bowls
-from steward.ego.cobot_skills import CobotSkills, MotionConfig
+from steward.ego.cobot_skills import CobotSkills, MotionConfig, _tool_down
 from steward.ego.estimator import EgoEstimator
 from steward.world.sim import WorldSim
 
@@ -45,16 +45,21 @@ def _objects(sim: WorldSim) -> dict[str, dict]:
 
 
 def test_the_three_bowls_and_the_other_tableware_sit_within_the_twins_reach(rig) -> None:
-    sim, _, _, _ = rig
+    sim, _, skills, _ = rig
     objects = _objects(sim)
     assert {"w:bowl-red", "w:bowl-green", "w:bowl-blue", "w:wine-glass", "w:mug"} <= set(objects)
     radii = {eid: float(sim.entity_obb(eid).size[0]) / 2.0 for eid in objects}
-    # Every pick and every nest happens on the centre line of the table, inside the band both arms
-    # cover; nothing may be further out than the twin can reach with a tilted tool.
-    for eid, ent in objects.items():
-        x, y = float(ent["pose"]["value"]["p"][0]), float(ent["pose"]["value"]["p"][1])
-        assert 0.10 <= x <= 0.60, f"{eid} at x={x:.2f} is outside the reachable tabletop band"
-        assert abs(y) <= 0.45, f"{eid} at y={y:.2f} is outside the reachable tabletop band"
+    # The task grasps the three bowls: each must be reachable by the arm on its side, at the pose
+    # it stands in. Asked of the solver, not of a hardcoded band, so a layout change cannot pass
+    # this test while being unreachable.
+    ik, tool = skills.ik, _tool_down()
+    ik.set_base(0.0, 0.0, 0.0, float(sim.sensors("w:cobot-1")["joints"]["lift"]))
+    for eid in ("w:bowl-red", "w:bowl-green", "w:bowl-blue"):
+        x, y, z = (float(v) for v in objects[eid]["pose"]["value"]["p"])
+        ik.solve_tool("L" if y >= 0 else "R", [x, y, z + 0.03], tool, max_tilt=0.7)
+    # The glass and the mug are left on the table; they stand beyond the arms' strip, in view.
+    for eid in ("w:wine-glass", "w:mug"):
+        assert float(objects[eid]["pose"]["value"]["p"][0]) > 0.60
     # No two pieces of tableware overlap: they must each be seen and grasped on their own.
     ids = sorted(objects)
     for i, a in enumerate(ids):
@@ -71,8 +76,8 @@ def test_the_largest_bowl_sits_on_the_line_both_arms_can_reach(rig) -> None:
     bowls = sorted((eid for eid in objects if objects[eid]["category"]["value"] == "bowl"),
                    key=lambda eid: -sim.entity_obb(eid).size[0])
     assert [round(sim.entity_obb(eid).size[0], 2) for eid in bowls] == [0.30, 0.20, 0.12]
-    # The nesting target is this bowl's centre: it has to be reachable by the left arm (which
-    # carries the green bowl) and by the right arm (which carries the blue one).
+    # The nesting target is this bowl's centre: the arm carrying either smaller bowl has to reach
+    # it, so it stands on the shared centre line between the arms.
     y = float(objects[bowls[0]]["pose"]["value"]["p"][1])
     assert abs(y) <= 0.05, f"the largest bowl is at y={y:.2f}, off the shared centre line"
 
