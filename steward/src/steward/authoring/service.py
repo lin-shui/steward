@@ -20,6 +20,7 @@ from steward.assets.generators import GENERATORS
 from steward.assets.library import AssetLibrary, instantiate
 from steward.assets.preview import render_scene, render_template
 from steward.assets.validator import validate_template
+from steward.embodiments import EMBODIMENTS, describe, scenario_embodiments
 from steward.math3d import pose_compose, quat_from_yaw, yaw_from_quat
 from steward.scene.extent import entity_obb
 from steward.scene.mjcf import build_mjcf
@@ -223,6 +224,33 @@ class AuthoringService:
     def list_scenarios(self) -> list[str]:
         return sorted(p.stem for p in (self.root / "scenarios").glob("*.json"))
 
+    def scenario_catalog(self) -> list[dict]:
+        """Every scenario the host can load, with its task and the body of each robot.
+
+        Built scenarios are read from disk; builtin scenarios not yet built in this root are
+        listed from their specs (``built: false``) so the console can offer them and
+        :meth:`ensure_scenario` builds them on first load.
+        """
+        out: dict[str, dict] = {}
+        for name in self.list_scenarios():
+            scenario = self.load_scenario(name)
+            out[name] = {"name": name, "task": scenario["task"], "mission": scenario.get("mission"),
+                         "robots": scenario_embodiments(scenario), "built": True}
+        for name, builtin in BUILTIN_SCENARIOS.items():
+            if name in out:
+                continue
+            robots = {e["id"]: describe(e["asset"]) for e in builtin["spec"]()["entities"]
+                      if e["asset"] in EMBODIMENTS}
+            out[name] = {"name": name, "task": builtin["task"], "mission": builtin.get("mission"),
+                         "robots": robots, "built": False}
+        return [out[name] for name in sorted(out)]
+
+    def ensure_scenario(self, name: str) -> None:
+        """Build a builtin scenario that is not in this root yet; anything else is left to
+        :meth:`load_scenario` to find or report."""
+        if name in BUILTIN_SCENARIOS and name not in self.list_scenarios():
+            BUILTIN_SCENARIOS[name]["build"](self)
+
 
 def kitchen_spec() -> dict:
     """The Phase 0 kitchen: counter with a cup and a bowl, a dining table with a plate, a drawer
@@ -391,6 +419,9 @@ def _publish_assets(service: AuthoringService, assets: dict[str, tuple[str, dict
     return published
 
 
+KITCHEN_TASK = "把杯子放到桌上。"
+
+
 def build_default_kitchen(service: AuthoringService) -> dict:
     """Generate, validate and publish the kitchen assets, compose the scene and save the scenario."""
     published = _publish_assets(service, KITCHEN_ASSETS)
@@ -399,7 +430,7 @@ def build_default_kitchen(service: AuthoringService) -> dict:
         "name": "phase0-kitchen",
         "scene": "phase0-kitchen",
         "robots": ["w:robot-1"],
-        "task": "把杯子放到桌上。",
+        "task": KITCHEN_TASK,
     })
     service.compose_scene(shuttle_spec())
     service.save_scenario({
@@ -440,6 +471,8 @@ def build_cobot_workstation(service: AuthoringService) -> dict:
         "scene": "cobot-table",
         "robots": ["w:cobot-1"],
         "task": COBOT_TASK,
+        # The scripted mission the twin's Ego Runtime runs in this scene (`steward cobot-ego --task`).
+        "mission": "bowl-on-plate",
         # Frame the console on the workstation: both arms and both pieces of tableware fill the
         # view, which is the only way a three-centimetre grasp is visible on the Ego-State panel.
         "view": {"lookat": [0.30, 0.14, 0.80], "distance": 1.9, "azimuth": 90.0, "elevation": -35.0},
@@ -471,8 +504,23 @@ def build_cobot_kitchen(service: AuthoringService) -> dict:
         "scene": "cobot-kitchen",
         "robots": ["w:cobot-1"],
         "task": COBOT_KITCHEN_TASK,
+        "mission": "nest-bowls",
         # Frame the console on the twin and its table: the arms are 0.5 m tall and the grasp is
         # 3 cm, which is invisible from the room-sized default.
         "view": {"lookat": [0.32, 0.10, 0.80], "distance": 1.9, "azimuth": 90.0, "elevation": -35.0},
     })
     return {"assets": {k: v["version"][:12] for k, v in published.items()}, "scene": scene, "scenario": scenario}
+
+
+# The scenarios the CLI and the console can build on demand, with what the catalog says about
+# them before they exist in a root. ``build`` may write several scenarios at once (the kitchen
+# builder saves all three Phase 0 scenarios), so the table names each one it produces.
+BUILTIN_SCENARIOS: dict[str, dict] = {
+    "phase0-kitchen": {"build": build_default_kitchen, "spec": kitchen_spec, "task": KITCHEN_TASK},
+    "phase0-shuttle": {"build": build_default_kitchen, "spec": shuttle_spec, "task": SHUTTLE_TASK},
+    "phase0-chores": {"build": build_default_kitchen, "spec": chores_spec, "task": CHORES_TASK},
+    "cobot-table": {"build": build_cobot_workstation, "spec": cobot_spec, "task": COBOT_TASK,
+                    "mission": "bowl-on-plate"},
+    "cobot-kitchen": {"build": build_cobot_kitchen, "spec": cobot_kitchen_spec, "task": COBOT_KITCHEN_TASK,
+                      "mission": "nest-bowls"},
+}

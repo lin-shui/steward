@@ -23,4 +23,4 @@ Kinematic facts (from `piper_description_v100_camera.urdf`, verified 2026-10-30)
 - The `*_left.xacro` / `*_right.xacro` variants are the two installed arms.
 
 Used by the `agilex` branch as the kinematic source of truth for the
-Cobot Magic embodiment twin (`embodiments/cobot-magic.yaml`).
+Cobot Magic embodiment twin (`steward/embodiments/cobot-magic.yaml`).

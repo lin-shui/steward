@@ -893,6 +893,21 @@ class EgoEstimator:
         self.tracks = {held.id: held} if held is not None else {}
         self.version += 1
 
+    def reboot(self) -> None:
+        """Forget everything, as a power cycle would: the world's clock went backwards, so no track,
+        load or encoder reading from before is about this episode. The body model stays; the id
+        counter goes on so a console label never means two different objects."""
+        self.tracks = {}
+        self.stamp = 0.0
+        self.held_since = 0.0
+        self.odometry = {"x": 0.0, "y": 0.0, "yaw": 0.0, "sigma": {"pos": 0.01, "yaw": 0.01}}
+        self.joints = {}
+        self.gripper = {"state": "open", "holding": False}
+        self.grippers = {}
+        self.held_id = None
+        self.held_gripper = None
+        self.version += 1
+
     # ---------------------------------------------------------------- holding
     def mark_held(self, track_id: str, since: float | None = None, gripper: str | None = None,
                   at: list[float] | None = None) -> None:
@@ -1072,7 +1087,9 @@ class EgoEstimator:
         # fact, so it is read here rather than mutating the track from a rendering thread.
         held_at = self.held_position(None if self_frame is None else self_frame.get("joints"))
         relations: list[Relation] = []
-        for track in self.tracks.values():
+        # A snapshot of the track objects: the Ego-State is also read from a view thread while the
+        # perception thread adds and drops tracks, and a dict that changes size mid-iteration raises.
+        for track in list(self.tracks.values()):
             entities.append(self._track_entity(track, at=held_at if track.id == self.held_id else None))
             if track.held:
                 relations.append(Relation(type="attached", a={"entity": track.id}, b={"entity": SELF_ID, "link": "gripper"},

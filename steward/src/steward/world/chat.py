@@ -138,6 +138,10 @@ class HarnessChat:
         self._next_id = 1
         self.agents: dict[str, _Agent] = {}
         self._seen_alerts: set[int] = set()
+        # What the attached robot's body can be asked to do. Ego Harness tasks drive skills through
+        # the Ego API, so a body whose Ego API does not expose them is shown as unavailable rather
+        # than failing every message (`steward up` sets this from the embodiment registry).
+        self.robot_reason: Callable[[], str | None] | None = None
         if config is None:
             return
         self.agents["world"] = _Agent(
@@ -154,9 +158,14 @@ class HarnessChat:
             before_turn=lambda: self._robot_control("acquire"),
             after_turn=lambda: self._robot_control("release"),
             on_failure=lambda message: self._robot_alert(message),
-            extra_reason=lambda: None if config.ego_api else "the robot's Ego API is not known to this host")
+            extra_reason=self._robot_reason)
 
     # ------------------------------------------------------------ public API
+    def _robot_reason(self) -> str | None:
+        if not self.config or not self.config.ego_api:
+            return "the robot's Ego API is not known to this host"
+        return self.robot_reason() if self.robot_reason is not None else None
+
     def unavailable_reason(self, key: str) -> str | None:
         agent = self.agents.get(key)
         if agent is None or self.config is None:

@@ -98,9 +98,15 @@ class RobotLink:
     def sensors(self) -> dict:
         return call("GET", f"{self.url}/sensors")
 
-    def rgbd(self) -> bytes:
-        """One RGB-D frame (``npz``) when the world provides raw imaging instead of detections."""
-        return call("GET", f"{self.url}/sensors/rgbd")
+    def proprioception(self) -> dict:
+        """Joint encoders and gripper states only, without drawing a perception sample."""
+        return call("GET", f"{self.url}/sensors/proprioception")
+
+    def rgbd(self, camera: str | None = None) -> bytes:
+        """One RGB-D frame (``npz``) when the world provides raw imaging instead of detections;
+        ``camera`` picks one of the robot's cameras (the first by default)."""
+        query = f"?camera={camera}" if camera else ""
+        return call("GET", f"{self.url}/sensors/rgbd{query}")
 
     def command(self, cmd: dict) -> None:
         call("POST", f"{self.url}/command", cmd)

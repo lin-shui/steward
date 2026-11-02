@@ -2,11 +2,13 @@
 
     steward build-kitchen            generate, validate and publish the Phase 0 kitchen
     steward world                    run WSim + Observer + WCA + robot ports
-    steward ego                      run one robot's Ego Runtime + Ego API
-    steward up                       run the world, and the robot's Ego Runtime in its own process
+    steward ego                      run the mobile robot's Ego Runtime + Ego API
+    steward cobot-ego                run the Cobot Magic twin's Ego Runtime + Ego API (+ its scripted mission)
+    steward up                       run the world, and each robot's Ego Runtime in a process of its body's kind
     steward demo                     scripted "cup to table" mission, checked against World State
     steward shuttle                  carry objects around table → cabinet → sideboard, step by step
     steward chores                   sort tableware, stack it on the sideboard, swap drawer contents; repeat
+    steward cobot                    the twin with its console in one process, rounds driven by world edits
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import threading
 import time
 from pathlib import Path
 
+from steward.embodiments import EMBODIMENTS
 from steward.phases import LATEST_PHASE, PHASES
 
 STEWARD_DIR = Path(__file__).resolve().parents[2]
@@ -32,6 +35,9 @@ DEFAULT_ROOT = STEWARD_DIR / "var" / "steward"
 # is somebody else's world.
 COBOT_WCA_PORT = 7430
 COBOT_ROBOT_PORT = 7440
+# The twin's scripted missions (steward.ego.cobot_runtime.MISSIONS), named here so parsing the
+# command line does not import the skill layer and its IK solver.
+COBOT_MISSIONS = ("bowl-on-plate", "nest-bowls")
 
 
 def _robot_model() -> dict:
@@ -75,7 +81,9 @@ def _host(args, run_dir: Path):
     _require_free({"console (world)": getattr(args, "wca_port", 0),
                    "robot": getattr(args, "robot_port", 0),
                    "ego api": getattr(args, "api_port", 0)})
-    ports = {"w:robot-1": args.robot_port} if getattr(args, "robot_port", 0) else {}
+    # ``"*"`` is the port the scenario's first robot gets, whatever its id: which body a scenario
+    # puts in the world is its business, and the operator asked for a fixed robot port.
+    ports = {"*": args.robot_port} if getattr(args, "robot_port", 0) else {}
     return StewardHost(args.root, scenario=args.scenario, speed=args.speed, seed=args.seed, run_dir=run_dir,
                        wca_port=args.wca_port, robot_ports=ports, chat=_chat_config(args),
                        phase=args.phase, bind_wait_s=getattr(args, "bind_wait", 0.0),
@@ -124,7 +132,12 @@ def cmd_world(args) -> int:
     run_dir = Path(args.root) / "runs" / time.strftime("%Y%m%d-%H%M%S")
     host = _host(args, run_dir)
     if args.ego_api:
-        host.attach_ego_api("w:robot-1", args.ego_api)
+        # Whatever body this scenario has: its robots are the scenario's, not a fixed id.
+        robot = next(iter(host.scenario["robots"]), None)
+        if robot is None:
+            raise SystemExit("steward world: the scenario has no robots, so there is no robot to attach an Ego API to")
+        host.attach_ego_api(robot, args.ego_api,
+                            skills=EMBODIMENTS[host.embodiments[robot]["id"]]["skills"] if host.embodiments[robot]["registered"] else False)
     print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url, "robots": {k: v.url for k, v in host.robot_servers.items()},
                       "runDir": str(run_dir)}), flush=True)
     _wait_forever([host.stop], host.pump)
@@ -151,6 +164,25 @@ def cmd_ego(args) -> int:
     return 0
 
 
+def cmd_cobot_ego(args) -> int:
+    """The Cobot Magic twin's Ego Runtime behind a robot port, as `steward up` runs it."""
+    from steward.ego.cobot_runtime import CobotEgoRuntime
+    from steward.ego.cobot_server import cobot_ego_api
+    from steward.ego.runtime import RobotLink
+
+    out_dir = Path(args.out_dir) if args.out_dir else Path(args.root) / "ego" / "observations"
+    runtime = CobotEgoRuntime(RobotLink(args.robot_url), task=args.task, out_dir=out_dir)
+    api = cobot_ego_api(runtime.estimator, port=args.api_port, bind_wait_s=args.bind_wait,
+                        live=runtime.proprioception)
+    # The first line is the contract with the launcher: everything after it is the runtime's own.
+    print(json.dumps({"egoApi": api.url, "robot": args.robot_url, "mission": args.task}), flush=True)
+    runtime.start()
+    if args.parent_pid:
+        _exit_with_parent(args.parent_pid)
+    _wait_forever([api.stop, runtime.stop])
+    return 0
+
+
 def _exit_with_parent(parent_pid: int) -> None:
     """Stop this process (as SIGTERM would) once the process that launched it is gone."""
     def watch() -> None:
@@ -162,17 +194,25 @@ def _exit_with_parent(parent_pid: int) -> None:
 
 
 class _EgoProcess:
-    """The robot's Ego Runtime, Ego API and Ego-State view in a process of its own, as on a robot:
-    nothing of it shares memory or OpenGL contexts with the world. Its output is passed through."""
+    """One robot's Ego Runtime, Ego API and Ego-State view in a process of its own, as on a robot:
+    nothing of it shares memory or OpenGL contexts with the world. Which runtime to run is the
+    body's business: the embodiment registry names the `steward` subcommand. Its output is passed
+    through."""
 
-    def __init__(self, args, robot_url: str, out_dir: Path):
-        cmd = [sys.executable, "-m", "steward.cli", "--root", str(args.root), "ego", "--robot-url", robot_url,
-               "--api-port", str(args.api_port), "--out-dir", str(out_dir), "--parent-pid", str(os.getpid()),
-               "--bind-wait", str(args.bind_wait)]
+    def __init__(self, args, robot_url: str, out_dir: Path, *, embodiment: str, api_port: int,
+                 task: str | None = None):
+        self.embodiment = embodiment
+        body = EMBODIMENTS[embodiment]
+        cmd = [sys.executable, "-m", "steward.cli", "--root", str(args.root), body["ego"],
+               "--robot-url", robot_url, "--api-port", str(api_port), "--out-dir", str(out_dir),
+               "--parent-pid", str(os.getpid()), "--bind-wait", str(args.bind_wait)]
+        if task is not None:
+            cmd += ["--task", task]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, start_new_session=True)
         first = self.proc.stdout.readline()
         if not first:
-            raise SystemExit(f"the Ego Runtime process exited with status {self.proc.wait()} before starting")
+            raise SystemExit(f"the Ego Runtime process for {robot_url} ({body['ego']}) exited with status "
+                             f"{self.proc.wait()} before starting")
         self.url = json.loads(first)["egoApi"]
         self._stopping = False
         self._reported = False
@@ -201,26 +241,108 @@ class _EgoProcess:
                 self.proc.wait()
 
 
+class EgoSupervisor:
+    """`steward up`'s keeper of Ego Runtime processes: one per robot of the loaded scenario, of the
+    kind its body needs.
+
+    A scenario switch is two steps around the world's own swap. :meth:`depart` runs first, while
+    the old world is still up, and stops every runtime that cannot survive the new scenario -- a
+    runtime still polling when its world is replaced would see the clock go back and start a
+    round against a scenario it is not built for. :meth:`reconcile` runs afterwards and starts
+    the runtimes the new bodies need. Same robot, same body: the process is kept and reboots
+    itself on the clock change, so the console's 重置 does not cost a process.
+
+    The first robot keeps the fixed Ego API port (the console chat and `steward chores --api`
+    find it there); any further robot takes a free port. A robot whose body is not in the
+    registry is left alone and said so: the world shows it, nothing drives it.
+    """
+
+    def __init__(self, args, run_dir: Path):
+        self.args = args
+        self.run_dir = run_dir
+        self.procs: dict[str, _EgoProcess] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _departing(wanted: dict[str, dict], procs: dict[str, _EgoProcess]) -> list[str]:
+        return [rid for rid, proc in procs.items()
+                if rid not in wanted or wanted[rid]["id"] != proc.embodiment]
+
+    def depart(self, host, scenario: dict) -> None:
+        """Stop the runtimes whose robot or body is not in the scenario about to load."""
+        from steward.embodiments import scenario_embodiments
+
+        with self._lock:
+            for rid in self._departing(scenario_embodiments(scenario), self.procs):
+                self.procs.pop(rid).stop()
+                host.detach_ego_api(rid)
+
+    def reconcile(self, host) -> dict[str, str]:
+        with self._lock:
+            wanted = host.embodiments
+            for rid in self._departing(wanted, self.procs):
+                self.procs.pop(rid).stop()
+                host.detach_ego_api(rid)
+            for rid, body in wanted.items():
+                if rid in self.procs:
+                    continue
+                if not body["registered"]:
+                    print(f"steward up: {rid} is a {body['id']}, which is not a registered embodiment; "
+                          f"no Ego Runtime drives it", file=sys.stderr, flush=True)
+                    continue
+                task = host.scenario.get("mission") if EMBODIMENTS[body["id"]]["runs_mission"] else None
+                proc = _EgoProcess(self.args, host.robot_servers[rid].url, self.run_dir / f"ego-{rid.removeprefix('w:')}",
+                                   embodiment=body["id"], api_port=self.args.api_port if not self.procs else 0,
+                                   task=task)
+                self.procs[rid] = proc
+                host.attach_ego_api(rid, proc.url, skills=EMBODIMENTS[body["id"]]["skills"])
+            if host.chat.config is not None:
+                host.chat.config.ego_api = self.primary_url()
+            return {rid: proc.url for rid, proc in self.procs.items()}
+
+    def primary_url(self) -> str | None:
+        return next((proc.url for proc in self.procs.values()), None)
+
+    def check(self) -> None:
+        with self._lock:
+            procs = list(self.procs.values())
+        for proc in procs:
+            proc.check()
+
+    def stop(self) -> None:
+        with self._lock:
+            procs = list(self.procs.values())
+            self.procs.clear()
+        for proc in procs:
+            proc.stop()
+
+
 def cmd_up(args) -> int:
     run_dir = Path(args.root) / "runs" / time.strftime("%Y%m%d-%H%M%S")
     host = _host(args, run_dir)
-    robot_url = host.robot_servers["w:robot-1"].url
+    egos = EgoSupervisor(args, run_dir)
     try:
-        ego = _EgoProcess(args, robot_url, run_dir / "ego")
+        egos.reconcile(host)
     except BaseException:
+        egos.stop()
         host.stop()
         raise
-    host.attach_ego_api("w:robot-1", ego.url)
-    if host.chat.config is not None:
-        host.chat.config.ego_api = ego.url
-    print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url, "robot": robot_url, "egoApi": ego.url, "runDir": str(run_dir),
-                      "task": host.scenario["task"]}, ensure_ascii=False), flush=True)
+    # The console can load a scenario with another body: its departing robots' runtimes stop
+    # before the world they poll is replaced, and the new bodies' runtimes follow.
+    host.before_episode_load = lambda scenario: egos.depart(host, scenario)
+    host.on_episode_loaded = lambda: egos.reconcile(host)
+    primary = next(iter(host.scenario["robots"]), None)
+    print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
+                      "robot": host.robot_servers[primary].url if primary else None, "egoApi": egos.primary_url(),
+                      "robots": {rid: {"url": host.robot_servers[rid].url, "embodiment": body["id"],
+                                       "egoApi": host.ego_apis.get(rid)} for rid, body in host.embodiments.items()},
+                      "runDir": str(run_dir), "task": host.scenario["task"]}, ensure_ascii=False), flush=True)
 
     def pump(timeout: float) -> None:
         host.pump(timeout)
-        ego.check()
+        egos.check()
 
-    _wait_forever([ego.stop, host.stop], pump)
+    _wait_forever([egos.stop, host.stop], pump)
     return 0
 
 
@@ -292,7 +414,6 @@ def cmd_build_cobot_kitchen(args) -> int:
 def cmd_cobot(args) -> int:
     """Run the Cobot Magic twin with its console; the mission is driven by the robot's own perception."""
     from steward.assets.cobot import cobot_magic
-    from steward.authoring.service import AuthoringService, build_cobot_kitchen, build_cobot_workstation
     from steward.ego.cobot_mission import bowl_onto_plate, nest_bowls
     from steward.ego.cobot_server import cobot_ego_api
     from steward.ego.cobot_skills import CobotSkills
@@ -301,11 +422,8 @@ def cmd_cobot(args) -> int:
     from steward.phases import phase_modules
 
     args.scenario = args.scenario or ("cobot-kitchen" if args.task == "nest-bowls" else "cobot-table")
-    service = AuthoringService(args.root)
-    if args.scenario not in service.list_scenarios():
-        (build_cobot_kitchen if args.task == "nest-bowls" else build_cobot_workstation)(service)
     run_dir = Path(args.root) / "runs" / ("cobot-" + time.strftime("%Y%m%d-%H%M%S"))
-    host = _host(args, run_dir)
+    host = _host(args, run_dir)  # builds the builtin scenario on first use
     sim = host.sim
     robot_id = host.scenario["robots"][0]
     skills = CobotSkills(command=lambda cmd: sim.command(robot_id, cmd), state=lambda: sim.sensors(robot_id))
@@ -315,7 +433,7 @@ def cmd_cobot(args) -> int:
     # watches the belief the skills are acting on -- not a second, independent one. Its self part
     # reads the twin's encoders on every frame, so the arm on that panel moves with the arm.
     ego = cobot_ego_api(est, port=0, live=lambda: sim.proprioception(robot_id))
-    host.attach_ego_api(robot_id, ego.url)
+    host.attach_ego_api(robot_id, ego.url, skills=False)
 
     def sensed_frame() -> dict:
         return decode_rgbd(sim.rgbd(robot_id, camera="top_camera")) if rgbd else sim.sensors(robot_id)
@@ -638,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "shuttle":
             p.add_argument("--steps", type=int, default=6, help="number of moves; 0 repeats until Ctrl-C")
         if name == "cobot":
-            p.add_argument("--task", choices=("bowl-on-plate", "nest-bowls"), default="bowl-on-plate",
+            p.add_argument("--task", choices=COBOT_MISSIONS, default="bowl-on-plate",
                            help="what the twin does in the scene: bowl onto the plate, or nest the three "
                                 "coloured bowls of the kitchen (the cobot-kitchen scenario)")
             p.add_argument("--ground-truth", action="store_true",
@@ -648,14 +766,19 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--api", help="Ego API of a running `steward up`; omit to run in-process")
             p.add_argument("--wca", default="http://127.0.0.1:7400", help="WCA of the running world (with --api)")
         p.set_defaults(fn=fn)
-    p = sub.add_parser("ego")
-    p.add_argument("--robot-url", default="http://127.0.0.1:7410")
-    p.add_argument("--api-port", type=int, default=7420)
-    p.add_argument("--out-dir", help="where the runtime writes its observations (default: <root>/ego/observations)")
-    p.add_argument("--parent-pid", type=int, help="exit when this process is gone (set by `steward up`)")
-    p.add_argument("--bind-wait", type=float, default=10.0,
-                   help="seconds to wait for a fixed port still held by a service that just stopped")
-    p.set_defaults(fn=cmd_ego)
+    for name, fn in (("ego", cmd_ego), ("cobot-ego", cmd_cobot_ego)):
+        p = sub.add_parser(name)
+        p.add_argument("--robot-url", default="http://127.0.0.1:7410")
+        p.add_argument("--api-port", type=int, default=7420)
+        p.add_argument("--out-dir", help="where the runtime writes its observations (default: <root>/ego/observations)")
+        p.add_argument("--parent-pid", type=int, help="exit when this process is gone (set by `steward up`)")
+        p.add_argument("--bind-wait", type=float, default=10.0,
+                       help="seconds to wait for a fixed port still held by a service that just stopped")
+        if name == "cobot-ego":
+            p.add_argument("--task", choices=COBOT_MISSIONS, default=None,
+                           help="scripted mission the twin runs in its scene, round after round, each new "
+                                "episode (the scenario's `mission`); omit to only perceive")
+        p.set_defaults(fn=fn)
     args = parser.parse_args(argv)
     try:
         return args.fn(args)

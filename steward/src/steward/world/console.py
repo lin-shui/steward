@@ -38,7 +38,10 @@ def console_state(host) -> dict:
             ground_truth.append(_box(ent.id, ent.category.value, ent.role, sim.entity_obb(ent.id)))
     status = sim.status()
     robots = {}
-    for rid in host.robot_servers:
+    # The robots of the loaded scenario, not every robot port the host has ever opened: after a
+    # switch to a scenario with another body the old robot's port is still bound, but there is
+    # nothing behind it to show.
+    for rid in (host.scenario or {}).get("robots", list(host.robot_servers)):
         ego = host.observer.latest_ego.get(rid)
         record = host.observer.latest.get(rid, {})
         robots[rid] = {
@@ -51,6 +54,7 @@ def console_state(host) -> dict:
                               h.get("phase")]
                              for h in host.observer.history.get(rid, []) if h.get("meanPositionErrorM") is not None][-300:],
             "camera": f"robot:{rid}",
+            "embodiment": host.embodiments.get(rid),
         }
     floor = next((g for g in ground_truth if g["category"] == "floor"), None)
     cx, cy = (floor["center"][0], floor["center"][1]) if floor else (0.0, 0.0)
@@ -65,6 +69,7 @@ def console_state(host) -> dict:
         "loaded": True,
         "view": view,
         "scenario": (host.scenario or {}).get("name"),
+        "embodiments": host.embodiments,
         "phase": host.phase_state(),
         "task": (host.scenario or {}).get("task"),
         "t": round(status["t"], 2),

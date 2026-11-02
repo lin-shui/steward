@@ -8,7 +8,7 @@ approximated by capsules between consecutive joint origins at the zero pose.
 
 Assembly-level dimensions (arm separation, mount height, top camera) are
 MEASURE placeholders pending the physical survey of the agilex workstation;
-see ``embodiments/cobot-magic.yaml``. The root is fixed: the workstation is
+see ``steward/embodiments/cobot-magic.yaml``. The root is fixed: the workstation is
 welded to the world, and a scene places it via the entity pose.
 """
 
