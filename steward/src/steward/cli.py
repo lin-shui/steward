@@ -37,7 +37,7 @@ COBOT_WCA_PORT = 7430
 COBOT_ROBOT_PORT = 7440
 # The twin's scripted missions (steward.ego.cobot_runtime.MISSIONS), named here so parsing the
 # command line does not import the skill layer and its IK solver.
-COBOT_MISSIONS = ("bowl-on-plate", "nest-bowls")
+COBOT_MISSIONS = ("bowl-on-plate", "nest-bowls", "carry-to-counter")
 
 
 def _robot_model() -> dict:
@@ -171,7 +171,9 @@ def cmd_cobot_ego(args) -> int:
     from steward.ego.runtime import RobotLink
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(args.root) / "ego" / "observations"
-    runtime = CobotEgoRuntime(RobotLink(args.robot_url), task=args.task, out_dir=out_dir)
+    mission_kwargs = json.loads(args.mission_config) if args.mission_config else {}
+    runtime = CobotEgoRuntime(RobotLink(args.robot_url), task=args.task, out_dir=out_dir,
+                              mission_kwargs=mission_kwargs)
     api = cobot_ego_api(runtime.estimator, port=args.api_port, bind_wait_s=args.bind_wait,
                         live=runtime.proprioception)
     # The first line is the contract with the launcher: everything after it is the runtime's own.
@@ -200,14 +202,18 @@ class _EgoProcess:
     through."""
 
     def __init__(self, args, robot_url: str, out_dir: Path, *, embodiment: str, api_port: int,
-                 task: str | None = None):
+                 task: str | None = None, mission_config: dict | None = None):
         self.embodiment = embodiment
+        self.task = task
+        self.mission_config = dict(mission_config or {})
         body = EMBODIMENTS[embodiment]
         cmd = [sys.executable, "-m", "steward.cli", "--root", str(args.root), body["ego"],
                "--robot-url", robot_url, "--api-port", str(api_port), "--out-dir", str(out_dir),
                "--parent-pid", str(os.getpid()), "--bind-wait", str(args.bind_wait)]
         if task is not None:
             cmd += ["--task", task]
+        if self.mission_config:
+            cmd += ["--mission-config", json.dumps(self.mission_config, ensure_ascii=False)]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, start_new_session=True)
         first = self.proc.stdout.readline()
         if not first:
@@ -264,36 +270,56 @@ class EgoSupervisor:
         self._lock = threading.Lock()
 
     @staticmethod
-    def _departing(wanted: dict[str, dict], procs: dict[str, _EgoProcess]) -> list[str]:
+    def _wanted(scenario: dict) -> dict[str, tuple[str, str | None, dict]]:
+        """Per robot: the body, the mission and its parameters the scenario asks for."""
+        from steward.embodiments import scenario_embodiments
+
+        wanted: dict[str, tuple[str, str | None, dict]] = {}
+        for rid, body in scenario_embodiments(scenario).items():
+            if not body["registered"]:
+                continue
+            runs_mission = EMBODIMENTS[body["id"]]["runs_mission"]
+            wanted[rid] = (body["id"],
+                           scenario.get("mission") if runs_mission else None,
+                           dict(scenario.get("missionConfig") or {}) if runs_mission else {})
+        return wanted
+
+    @staticmethod
+    def _departing(wanted: dict[str, tuple[str, str | None, dict]],
+                   procs: dict[str, _EgoProcess]) -> list[str]:
+        """Robots whose runtime is not what the incoming scenario asks for.
+
+        A different body, a different mission, or different station parameters all mean the
+        process must go: a runtime is built around its mission and keeps its own belief, so
+        retasking it in place would leave it acting on the old scenario.
+        """
         return [rid for rid, proc in procs.items()
-                if rid not in wanted or wanted[rid]["id"] != proc.embodiment]
+                if wanted.get(rid) != (proc.embodiment, proc.task, proc.mission_config)]
 
     def depart(self, host, scenario: dict) -> None:
         """Stop the runtimes whose robot or body is not in the scenario about to load."""
-        from steward.embodiments import scenario_embodiments
-
         with self._lock:
-            for rid in self._departing(scenario_embodiments(scenario), self.procs):
+            for rid in self._departing(self._wanted(scenario), self.procs):
                 self.procs.pop(rid).stop()
                 host.detach_ego_api(rid)
 
     def reconcile(self, host) -> dict[str, str]:
         with self._lock:
-            wanted = host.embodiments
+            wanted = self._wanted(host.scenario)
             for rid in self._departing(wanted, self.procs):
                 self.procs.pop(rid).stop()
                 host.detach_ego_api(rid)
-            for rid, body in wanted.items():
+            for rid, body in host.embodiments.items():
                 if rid in self.procs:
                     continue
                 if not body["registered"]:
                     print(f"steward up: {rid} is a {body['id']}, which is not a registered embodiment; "
                           f"no Ego Runtime drives it", file=sys.stderr, flush=True)
                     continue
-                task = host.scenario.get("mission") if EMBODIMENTS[body["id"]]["runs_mission"] else None
+                _, task, mission_config = wanted[rid]
                 proc = _EgoProcess(self.args, host.robot_servers[rid].url, self.run_dir / f"ego-{rid.removeprefix('w:')}",
                                    embodiment=body["id"], api_port=self.args.api_port if not self.procs else 0,
-                                   task=task)
+                                   task=task, mission_config=mission_config)
                 self.procs[rid] = proc
                 host.attach_ego_api(rid, proc.url, skills=EMBODIMENTS[body["id"]]["skills"])
             if host.chat.config is not None:
@@ -411,17 +437,26 @@ def cmd_build_cobot_kitchen(args) -> int:
     return 0
 
 
+def cmd_build_cobot_errand(args) -> int:
+    from steward.authoring.service import AuthoringService, build_cobot_errand
+
+    out = build_cobot_errand(AuthoringService(args.root))
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_cobot(args) -> int:
     """Run the Cobot Magic twin with its console; the mission is driven by the robot's own perception."""
     from steward.assets.cobot import cobot_magic
-    from steward.ego.cobot_mission import bowl_onto_plate, nest_bowls
+    from steward.ego.cobot_runtime import MISSIONS
     from steward.ego.cobot_server import cobot_ego_api
     from steward.ego.cobot_skills import CobotSkills
     from steward.ego.estimator import EgoEstimator
     from steward.ego.perception import decode_rgbd
     from steward.phases import phase_modules
 
-    args.scenario = args.scenario or ("cobot-kitchen" if args.task == "nest-bowls" else "cobot-table")
+    default_scenario = {"nest-bowls": "cobot-kitchen", "carry-to-counter": "cobot-errand"}
+    args.scenario = args.scenario or default_scenario.get(args.task, "cobot-table")
     run_dir = Path(args.root) / "runs" / ("cobot-" + time.strftime("%Y%m%d-%H%M%S"))
     host = _host(args, run_dir)  # builds the builtin scenario on first use
     sim = host.sim
@@ -496,11 +531,14 @@ def cmd_cobot(args) -> int:
 
     def run_sensed_mission() -> None:
         rounds = args.rounds
-        mission = nest_bowls if args.task == "nest-bowls" else bowl_onto_plate
+        mission = MISSIONS[args.task]
+        # Station parameters are the scenario's: the same mission runs in a different kitchen by
+        # loading a different scenario, not by editing code.
+        kwargs = dict(host.scenario.get("missionConfig") or {})
         done, crashes = 0, 0
         while True:
             try:
-                result = mission(est, skills, sensed_frame, rgbd=rgbd)
+                result = mission(est, skills, sensed_frame, rgbd=rgbd, **kwargs)
                 outcome.update(result)
                 print(json.dumps({"mission": args.task, "round": done + 1, **result},
                                  ensure_ascii=False), flush=True)
@@ -518,6 +556,9 @@ def cmd_cobot(args) -> int:
             time.sleep(1.0)
             reset_for_next_round()
 
+    if args.ground_truth and args.task not in ("bowl-on-plate", "nest-bowls"):
+        raise SystemExit(f"steward cobot: --ground-truth is written against the table topologies "
+                         f"(bowl/plate ids), not the {args.task} scenario")
     worker = threading.Thread(target=run_truth_mission if args.ground_truth else run_sensed_mission,
                               name="cobot-mission", daemon=True)
     worker.start()
@@ -721,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("build-kitchen").set_defaults(fn=cmd_build_kitchen)
     sub.add_parser("build-cobot").set_defaults(fn=cmd_build_cobot)
     sub.add_parser("build-cobot-kitchen").set_defaults(fn=cmd_build_cobot_kitchen)
+    sub.add_parser("build-cobot-errand").set_defaults(fn=cmd_build_cobot_errand)
     defaults = {"demo": "phase0-kitchen", "shuttle": "phase0-shuttle"}
     for name, fn in (("world", cmd_world), ("up", cmd_up), ("demo", cmd_demo), ("shuttle", cmd_shuttle),
                      ("chores", cmd_chores), ("cobot", cmd_cobot)):
@@ -778,6 +820,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--task", choices=COBOT_MISSIONS, default=None,
                            help="scripted mission the twin runs in its scene, round after round, each new "
                                 "episode (the scenario's `mission`); omit to only perceive")
+            p.add_argument("--mission-config", default=None,
+                           help="JSON object of parameters for the mission (the scenario's "
+                                "`missionConfig`: station poses and the like)")
         p.set_defaults(fn=fn)
     args = parser.parse_args(argv)
     try:

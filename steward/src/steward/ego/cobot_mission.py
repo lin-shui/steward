@@ -183,6 +183,55 @@ def nest_bowls(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], dict]
     return {"ok": False, "log": log}
 
 
+def carry_to_station(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], dict],
+                     drive: dict, place: list[float], lift: float | None = None,
+                     grip: str = "L_link6", retries: int = 2, rgbd: bool = False) -> dict:
+    """Take the bowl from this station and put it down at another one the robot drives to.
+
+    What it moves is perceived -- the bowl's position comes from the robot's own look at the
+    table it starts at. Where it goes is known: ``drive`` is the route (waypoints and final
+    heading) and ``place`` the world point on the destination's surface, the way a deployed
+    robot knows its furniture and measures what stands on it. ``lift`` raises the torso on
+    arrival, for a destination higher than the table it left.
+
+    The load is parked before the drive: an arm held out over the table would sweep the room
+    for two metres, and folding it is what a person does with a tray.
+    """
+    log: list[str] = []
+    arm = ARM_OF_GRIPPER.get(grip)
+    if arm is None:
+        return {"ok": False, "log": [f"unknown gripper {grip!r}"]}
+    for attempt in range(1, retries + 1):
+        seen = perceive(est, frame, rgbd=rgbd, frames=10 if rgbd else 8)
+        if "bowl" not in seen:
+            log.append(f"attempt {attempt}: no bowl in view")
+            continue
+        bowl = seen["bowl"]
+        log.append(f"attempt {attempt}: bowl {_fmt(bowl.pos)} (e:{bowl.track_id}, {bowl.range_m:.2f} m)")
+        try:
+            _run(skills, "pick", {"arm": arm, "gripper": grip, "at": [float(v) for v in bowl.pos]}, log)
+            est.mark_held(bowl.track_id, gripper=grip, at=bowl.pos)
+            _park(skills, grip, log)
+            _run(skills, "navigate", {"at": [float(v) for v in drive["at"]],
+                                      "path": [[float(p[0]), float(p[1])] for p in drive.get("path") or []]},
+                 log)
+            if lift is not None:
+                _run(skills, "lift", {"height": float(lift)}, log)
+            _run(skills, "place", {"arm": arm, "gripper": grip, "at": [float(v) for v in place]}, log)
+        except SkillStopped:
+            raise
+        except SkillFailed as exc:
+            log.append(f"attempt {attempt} failed: {exc}")
+            if _holding(skills, grip):
+                _run(skills, "open", {"gripper": grip}, log)
+                log.append(f"attempt {attempt}: put the bowl down where it was held")
+            _park_both(skills, log)
+            continue
+        return {"ok": True, "attempts": attempt, "bowl": bowl.pos.tolist(),
+                "station": [float(v) for v in place], "base": skills.tcp_base(), "log": log}
+    return {"ok": False, "log": log}
+
+
 # A nesting bowl's inner floor: the 8 mm base disc plus the 2 mm the wall segments are lifted by.
 _BOWL_FLOOR = 0.010
 # Released this far above the floor of the bowl below; see the docstring of nest_bowls.

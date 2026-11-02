@@ -121,8 +121,10 @@ def test_the_runtime_keeper_runs_one_process_of_the_right_kind_per_robot(kitchen
     stopped: list = []
 
     class FakeProcess:
-        def __init__(self, args, robot_url, out_dir, *, embodiment, api_port, task=None):
+        def __init__(self, args, robot_url, out_dir, *, embodiment, api_port, task=None,
+                     mission_config=None):
             self.embodiment, self.api_port, self.task = embodiment, api_port, task
+            self.mission_config = dict(mission_config or {})
             self.url = f"http://ego/{embodiment}/{api_port}"
             started.append(self)
 
@@ -160,11 +162,20 @@ def test_the_runtime_keeper_runs_one_process_of_the_right_kind_per_robot(kitchen
             "the twin's runtime takes over the fixed port and the scenario's mission"
         assert host.ego_apis == {"w:cobot-1": started[1].url}
 
+        # Another cobot scenario is another mission with its own stations: the process is not
+        # kept, because a runtime is built around its mission and its belief.
+        switch("cobot-errand")
+        errand = started[-1]
+        assert stopped[-1] is started[1], "a different mission on the same body restarts the runtime"
+        assert (errand.embodiment, errand.task) == ("cobot-magic", "carry-to-counter")
+        assert errand.mission_config["drive"]["at"] == [2.3, 0.0, 0.0]
+        assert host.ego_apis == {"w:cobot-1": errand.url}
+
         switch("phase0-shuttle")
-        assert stopped[-1] is started[1] and started[-1].embodiment == "steward-bot"
+        assert stopped[-1] is errand and started[-1].embodiment == "steward-bot"
 
         switch("phase0-kitchen")
-        assert len(started) == 3 and len(stopped) == 2, "same robot, same body: the runtime is kept and reboots itself"
+        assert len(started) == 4 and len(stopped) == 3, "same robot, same body: the runtime is kept and reboots itself"
     finally:
         keeper.stop()
         host.stop()

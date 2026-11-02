@@ -26,7 +26,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from steward.assets.cobot import cobot_magic
-from steward.ego.cobot_mission import bowl_onto_plate, nest_bowls, perceive
+from steward.ego.cobot_mission import bowl_onto_plate, carry_to_station, nest_bowls, perceive
 from steward.ego.cobot_skills import CobotSkills, MotionConfig
 from steward.ego.estimator import EgoEstimator
 from steward.ego.perception import decode_rgbd
@@ -35,6 +35,7 @@ from steward.ego.runtime import RobotLink
 MISSIONS: dict[str, Callable] = {
     "bowl-on-plate": bowl_onto_plate,
     "nest-bowls": nest_bowls,
+    "carry-to-counter": carry_to_station,
 }
 SURVEY_CAMERA = "top_camera"
 IDLE_LOOK_S = 2.0
@@ -45,11 +46,13 @@ RESET_MARGIN_S = 1e-6
 
 class CobotEgoRuntime:
     def __init__(self, link: RobotLink, task: str | None = None, config: MotionConfig | None = None,
-                 out_dir: Path | None = None, report: Callable[[dict], None] | None = None):
+                 out_dir: Path | None = None, report: Callable[[dict], None] | None = None,
+                 mission_kwargs: dict | None = None):
         if task is not None and task not in MISSIONS:
             raise ValueError(f"unknown mission {task!r}; known: {', '.join(MISSIONS)}")
         self.link = link
         self.task = task
+        self.mission_kwargs = dict(mission_kwargs or {})
         self.out_dir = out_dir
         self.report = report or _print_line
         self.estimator = EgoEstimator(robot_model=cobot_magic().to_dict())
@@ -139,7 +142,8 @@ class CobotEgoRuntime:
         self._reset.clear()
         frame, rgbd = self.frame_source()
         try:
-            result = MISSIONS[self.task](self.estimator, self.skills, frame, rgbd=rgbd)
+            result = MISSIONS[self.task](self.estimator, self.skills, frame, rgbd=rgbd,
+                                         **self.mission_kwargs)
         except Exception as exc:  # noqa: BLE001 - a crashed round is a failed round
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "log": []}
         self.rounds += 1

@@ -522,6 +522,79 @@ def build_cobot_kitchen(service: AuthoringService) -> dict:
     return {"assets": {k: v["version"][:12] for k, v in published.items()}, "scene": scene, "scenario": scenario}
 
 
+# The errand's map: where the twin stands to work each station, the route it drives between them,
+# and where the bowl goes. The route leaves the table's near edge and comes back to the counter
+# along the counter's own centre line -- the last turn is at x = 2.0, where the chassis's swept
+# corner (0.45 m) still clears the counter's front at 2.70, and the last 0.30 m is a straight
+# drive into the working pose, which is how a real base parks against a counter.
+COBOT_ERRAND_MISSION = {
+    "drive": {"at": [2.30, 0.0, 0.0],
+              "path": [[-0.20, -1.10], [2.00, -1.10], [2.00, 0.0], [2.30, 0.0]]},
+    # The counter's top (0.90) plus the bowl's half height and the 3 cm it is released above it.
+    "place": [2.80, 0.0, 0.96],
+    # The counter is 15 cm taller than the table: the torso rises before the place.
+    "lift": 0.78,
+    "grip": "L_link6",
+}
+
+
+def cobot_errand_spec() -> dict:
+    """Two stations the twin has to drive between: the dining table and a kitchen counter.
+
+    Nothing here is within reach of the other: the table's bowl is 0.46 m from the start pose,
+    the counter's drop point is 2.8 m away and 15 cm higher, so the mission can only succeed by
+    carrying the bowl across the room and raising the torso.
+    """
+    return {
+        "name": "cobot-errand",
+        "entities": [
+            {"id": "w:room", "asset": "cobot-errand-room", "at": {"x": 0.0, "y": 0.0}},
+            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
+            {"id": "w:table-1", "asset": "cobot-errand-table", "at": {"x": 0.90, "y": 0.0}},
+            # The bowl stands in the same reachable band as the kitchen: 0.46 m ahead, in front of
+            # the left arm, fully on the tabletop.
+            {"id": "w:bowl-1", "asset": "bowl", "on": "w:table-1", "offset": [-0.44, 0.20]},
+            # Turned a quarter turn so its 1.8 m front faces the robot: you park along a counter,
+            # not at its end.
+            {"id": "w:counter-1", "asset": "cobot-errand-counter",
+             "at": {"x": 3.0, "y": 0.0, "yaw": 1.5707963267948966}},
+        ],
+        "regions": [{"id": "flat", "label": "flat", "polygon": [[-4, -2.5], [4, -2.5], [4, 2.5], [-4, 2.5]]}],
+    }
+
+
+COBOT_ERRAND_TASK = "把桌上的碗搬到对面的台面上：自己开过去，到了再把升降柱升起来。"
+
+
+def build_cobot_errand(service: AuthoringService) -> dict:
+    """Publish the two stations and save the cobot-errand scenario (one bowl, two stations)."""
+    from steward.assets.cobot import cobot_magic
+
+    GENERATORS.setdefault("cobot_magic", cobot_magic)
+    assets = {
+        # Long enough for a 2.3 m drive around the table with room to spare at both ends.
+        "cobot-errand-room": ("building", {"width": 8.0, "depth": 5.0, "height": 2.6}),
+        "cobot-magic": ("cobot_magic", {}),
+        "cobot-errand-table": ("dining_table", {"width": 1.2, "depth": 1.0}),
+        "cobot-errand-counter": ("counter", {"width": 1.8, "depth": 0.6, "height": 0.9}),
+        "bowl": KITCHEN_ASSETS["bowl"],
+    }
+    published = _publish_assets(service, assets)
+    scene = service.compose_scene(cobot_errand_spec())
+    scenario = service.save_scenario({
+        "name": "cobot-errand",
+        "scene": "cobot-errand",
+        "robots": ["w:cobot-1"],
+        "task": COBOT_ERRAND_TASK,
+        "mission": "carry-to-counter",
+        # The map the mission is scripted against; stations belong to the deployment, not the code.
+        "missionConfig": COBOT_ERRAND_MISSION,
+        # From behind the start pose: the table, the robot and the route to the counter in one view.
+        "view": {"lookat": [1.4, 0.0, 0.70], "distance": 3.6, "azimuth": 90.0, "elevation": -40.0},
+    })
+    return {"assets": {k: v["version"][:12] for k, v in published.items()}, "scene": scene, "scenario": scenario}
+
+
 # The scenarios the CLI and the console can build on demand, with what the catalog says about
 # them before they exist in a root. ``build`` may write several scenarios at once (the kitchen
 # builder saves all three Phase 0 scenarios), so the table names each one it produces.
@@ -533,4 +606,6 @@ BUILTIN_SCENARIOS: dict[str, dict] = {
                     "mission": "bowl-on-plate"},
     "cobot-kitchen": {"build": build_cobot_kitchen, "spec": cobot_kitchen_spec, "task": COBOT_KITCHEN_TASK,
                       "mission": "nest-bowls"},
+    "cobot-errand": {"build": build_cobot_errand, "spec": cobot_errand_spec, "task": COBOT_ERRAND_TASK,
+                     "mission": "carry-to-counter"},
 }
