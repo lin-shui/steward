@@ -118,10 +118,10 @@
 <body>
 <header>
   <h1>Steward 控制台</h1>
-  <select id="scenario" title="Scenario：按本体分组；加载另一个本体的 Scenario 会重开 Episode 并换掉机器人运行时"></select>
+  <select id="body" title="本体：这台机器人是哪种身体。本体编译在世界模型里，所以选本体就是选要加载的场景，加载时才会换身体"></select>
+  <select id="scenario" title="Scenario：所选本体的场景；加载另一个本体的 Scenario 会重开 Episode 并换掉机器人运行时"></select>
   <button id="load">加载</button>
   <button id="reset">重置</button>
-  <span class="pill" id="body" title="本体：这个 Scenario 里的机器人是哪种身体">本体：–</span>
   <button id="pause">暂停</button>
   <select id="speed" title="仿真倍速">
     <option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option>
@@ -502,7 +502,7 @@ async function refresh() {
     perceptionAlerts = state.perceptionAlerts || [];
     renderAlerts();
     renderPhase(state.phase);
-    renderBody(state.embodiments);
+    renderBodies();
     renderRobotTarget();
     $('task').textContent = state.task ? `任务：${state.task}` : '';
     $('pause').textContent = state.paused ? '继续' : '暂停';
@@ -815,19 +815,80 @@ async function refreshRobotCamera() {
 }
 
 // ------------------------------------------------------------------ scenarios & bodies
-// The body (embodiment) of a scenario is the label of each robot's registered body; a scenario
-// with two robots of different bodies shows both.
+// ---------------------------------------------------------------- body & scenario
+// The body (embodiment) is a property of a scenario, not something swapped at run time: every
+// scenario puts one body in the world. The console makes it a control anyway -- pick the body,
+// the scenario list narrows to that body's scenes, and loading one is what changes the body
+// (with a confirmation, because it means a new episode and another Ego Runtime).
 let catalog = [];
 function bodyLabel(robots) {
   const labels = [...new Set(Object.values(robots || {}).map(r => r.label))];
   return labels.length ? labels.join(' + ') : '无机器人';
 }
-function renderBody(embodiments) {
-  const pill = $('body');
-  pill.textContent = `本体：${bodyLabel(embodiments)}`;
-  const bodies = Object.values(embodiments || {});
-  pill.title = bodies.length ? bodies.map(r => `${r.label}\n${r.description}`).join('\n\n') : '这个 Scenario 里没有机器人';
-  pill.style.color = bodies.some(r => r.registered === false) ? '#ffd27a' : '';
+function scenarioBody(scenario) {
+  const robots = Object.values((scenario && scenario.robots) || {});
+  return robots.length ? (robots[0].id || 'unknown') : 'none';
+}
+function catalogBodies() {
+  const seen = new Map();
+  for (const s of catalog) {
+    const id = scenarioBody(s);
+    if (!seen.has(id)) {
+      const robots = Object.values(s.robots || {});
+      seen.set(id, { id, label: bodyLabel(s.robots), description: (robots[0] || {}).description || '',
+                     registered: (robots[0] || {}).registered !== false });
+    }
+  }
+  return [...seen.values()];
+}
+function selectedBody() { return $('body').value; }
+// The scenarios of one body; `preferred` is kept selected when it belongs to that body.
+function fillScenarios(bodyId, preferred) {
+  const sel = $('scenario');
+  const items = catalog.filter(s => scenarioBody(s) === bodyId);
+  sel.innerHTML = items.map(s => {
+    const opt = document.createElement('option');
+    opt.value = s.name;
+    opt.textContent = s.built ? s.name : `${s.name} · 首次加载时构建`;
+    opt.title = s.task || '';
+    return opt.outerHTML;
+  }).join('');
+  const want = items.some(s => s.name === preferred) ? preferred : (items[0] ? items[0].name : '');
+  if (want) sel.value = want;
+  updateLoadButton();
+}
+function renderBodies() {
+  const bodies = catalogBodies();
+  const sel = $('body');
+  const key = bodies.map(b => `${b.id}:${b.label}`).join('|');
+  if (sel.dataset.key !== key) {
+    const keep = sel.value;
+    sel.dataset.key = key;
+    sel.innerHTML = bodies.map(b => `<option value="${esc(b.id)}">${esc(b.label)}</option>`).join('');
+    if (bodies.some(b => b.id === keep)) sel.value = keep;
+    else if (state && state.scenario) {
+      const loaded = catalog.find(s => s.name === state.scenario);
+      if (loaded) sel.value = scenarioBody(loaded);
+    }
+  }
+  const body = bodies.find(b => b.id === sel.value) || {};
+  const loadedBody = state && state.embodiments ? bodyLabel(state.embodiments) : null;
+  sel.title = `${body.label || '本体'}${body.description ? '\n' + body.description : ''}`
+    + (loadedBody ? `\n\n当前运行：${loadedBody}` : '');
+  sel.style.color = body.registered === false ? '#ffd27a' : '';
+  updateLoadButton();
+}
+// Say it on the button when loading would mean a different body, so the confirm is no surprise.
+function updateLoadButton() {
+  const name = $('scenario').value;
+  const target = catalog.find(s => s.name === name);
+  const loadedScenario = state && state.loaded ? state.scenario : null;
+  const switching = !!(target && loadedScenario && loadedScenario !== name
+    && scenarioBody(target) !== scenarioBody(catalog.find(s => s.name === loadedScenario) || {}));
+  $('load').textContent = switching ? '加载（换本体）' : '加载';
+  $('load').title = switching
+    ? '这会重开 Episode 并换掉机器人运行时：本体编译在世界模型里，不能热切换'
+    : '加载所选 Scenario';
 }
 // The robot the loaded scenario has: the chat target and its placeholder follow it, since the
 // console can hold a scenario of either body.
@@ -852,29 +913,24 @@ async function loadScenarios() {
   try {
     const res = await api('GET', '/scenarios');
     catalog = res.catalog || res.scenarios.map(name => ({ name, robots: {}, built: true }));
-    const groups = new Map();
-    for (const s of catalog) {
-      const key = bodyLabel(s.robots);
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(s);
-    }
-    const sel = $('scenario');
-    sel.innerHTML = '';
-    for (const [label, items] of groups) {
-      const group = document.createElement('optgroup');
-      group.label = `本体：${label}`;
-      for (const s of items) {
-        const opt = document.createElement('option');
-        opt.value = s.name;
-        opt.textContent = s.built ? s.name : `${s.name} · 首次加载时构建`;
-        opt.title = s.task || '';
-        group.appendChild(opt);
-      }
-      sel.appendChild(group);
-    }
-    if (state && state.scenario) sel.value = state.scenario;
+    renderBodies();
+    // Keep the operator's place: the scenario they are looking at, else the loaded one.
+    const chosen = $('scenario').value
+      || (state && state.scenario) || '';
+    fillScenarios(selectedBody(), chosen || (state && state.scenario));
   } catch (e) { showError(e); }
 }
+$('body').onchange = () => {
+  fillScenarios(selectedBody(), state && state.scenario);
+  renderBodies();
+};
+$('scenario').onchange = () => {
+  // Picking a scenario of another body moves the body selector with it (the list is filtered, so
+  // normally it cannot happen, but the loaded scenario and the catalog can disagree for a moment).
+  const target = catalog.find(s => s.name === $('scenario').value);
+  if (target && scenarioBody(target) !== selectedBody()) { $('body').value = scenarioBody(target); }
+  updateLoadButton();
+};
 $('load').onclick = async () => {
   const name = $('scenario').value;
   const target = catalog.find(s => s.name === name);
