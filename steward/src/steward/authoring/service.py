@@ -23,6 +23,7 @@ from steward.assets.generators import GENERATORS
 from steward.assets.library import AssetLibrary, instantiate
 from steward.assets.preview import render_scene, render_template
 from steward.assets.validator import validate_template
+from steward.embodiments import EMBODIMENTS, describe, scenario_embodiments
 from steward.math3d import pose_compose, quat_from_yaw, yaw_from_quat
 from steward.scene.extent import entity_obb
 from steward.scene.mjcf import build_mjcf
@@ -200,6 +201,33 @@ class AuthoringService:
 
     def list_scenes(self) -> list[str]:
         return sorted(p.stem for p in (self.root / "scenes").glob("*.json"))
+
+    def scenario_catalog(self) -> list[dict]:
+        """Every scenario the host can load, with its task and the body of each robot.
+
+        Built scenarios are read from disk; builtin scenarios not yet built in this root are
+        listed from their specs (``built: false``) so the console can offer them and
+        :meth:`ensure_scenario` builds them on first load.
+        """
+        out: dict[str, dict] = {}
+        for name in self.list_scenarios():
+            scenario = self.load_scenario(name)
+            out[name] = {"name": name, "task": scenario["task"], "mission": scenario.get("mission"),
+                         "robots": scenario_embodiments(scenario), "built": True}
+        for name, builtin in BUILTIN_SCENARIOS.items():
+            if name in out:
+                continue
+            robots = {e["id"]: describe(e["asset"]) for e in builtin["spec"]()["entities"]
+                      if e["asset"] in EMBODIMENTS}
+            out[name] = {"name": name, "task": builtin["task"], "mission": builtin.get("mission"),
+                         "robots": robots, "built": False}
+        return [out[name] for name in sorted(out)]
+
+    def ensure_scenario(self, name: str) -> None:
+        """Build a builtin scenario that is not in this root yet; anything else is left to
+        :meth:`load_scenario` to find or report."""
+        if name in BUILTIN_SCENARIOS and name not in self.list_scenarios():
+            BUILTIN_SCENARIOS[name]["build"](self)
 
     # -------------------------------------------------------------- scenarios
     def save_scenario(self, scenario: dict) -> dict:
@@ -578,10 +606,6 @@ def cobot_kitchen_spec() -> dict:
 
 
 COBOT_KITCHEN_TASK = "把桌上三个颜色不同的碗按大小叠起来；高脚杯和咖啡杯留在桌上。"
-
-
-
-KITCHEN_TASK = "把桌上三个颜色不同的碗按大小叠起来；高脚杯和咖啡杯留在桌上。"
 
 
 def _publish_assets(service: AuthoringService, assets: dict[str, tuple[str, dict]]) -> dict[str, str]:

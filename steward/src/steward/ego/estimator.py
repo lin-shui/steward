@@ -278,10 +278,14 @@ class EgoEstimator:
         at another odometry."""
         if sensor_id is not None:
             return self.camera_poses()[sensor_id]
-        if odometry is not None:
-            base = {"p": [odometry["x"], odometry["y"], 0.0], "q": quat_from_yaw(odometry["yaw"])}
-            return pose_compose(pose_compose(base, self._head_mount), self._camera["mount"])
-        return pose_compose(self.link_pose(self._camera_link_id), self._camera["mount"])
+        pose = pose_compose(self.link_pose(self._camera_link_id), self._camera["mount"])
+        if odometry is None:
+            return pose
+        # The same camera on a robot standing at another odometry: its pose in the base frame
+        # (from the current joint state), carried to that base pose.
+        base = {"p": [odometry["x"], odometry["y"], 0.0], "q": quat_from_yaw(odometry["yaw"])}
+        in_base = pose_compose(pose_inverse(self.base_pose()), pose)
+        return pose_compose(base, in_base)
 
     def _camera_link(self) -> str:
         return self._camera_link_id
@@ -1196,9 +1200,6 @@ class EgoEstimator:
         track.settled = False  # it settles where it was put down; the next view places it
         track.var = np.maximum(track.var, 0.02**2)
         track.yaw_var = max(track.yaw_var, YAW_MOVED**2)
-        track.recent.clear()  # it will be put down elsewhere
-        self.held_id = track_id
-        return track_id
 
     def remember_face(self, track_id: str, rgb: np.ndarray, stamp: float) -> Appearance | None:
         """Keep one view of a track's top face, sampled on its appearance grid (see

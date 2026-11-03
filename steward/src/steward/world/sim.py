@@ -143,6 +143,13 @@ class _RobotState:
         return any(g.attached == entity_id or (g.handle is not None and g.handle["entity"] == entity_id)
                    for g in self.grippers.values())
 
+    @property
+    def attached(self) -> str | None:
+        """The object the robot is holding, for a body with one gripper (the arm's own state is
+        the authority for a multi-gripper body: read ``grippers[link].attached``)."""
+        held = [g.attached for g in self.grippers.values() if g.attached is not None]
+        return held[0] if len(held) == 1 else None
+
 
 def _gripper_links(ent) -> list[str]:
     return [link.id for link in ent.rigid.links if any(a.value == "grasp-point" for a in link.affordances)]

@@ -195,12 +195,16 @@ def _settle(api: str, seconds: float = 45.0, want: int = 2) -> dict:
     own emptiness ("no table in the ego state", "one piece of tableware"). Nothing is moved here:
     the robot looks, and the round starts once there is something to plan about."""
     deadline = time.monotonic() + seconds
-    s = _summary(api)
+    s: dict = {"objects": [], "relations": []}
     while time.monotonic() < deadline:
+        try:
+            s = _summary(api)
+        except (HttpError, OSError):
+            time.sleep(2.0)  # the robot is not answering yet; the phases report a dead API themselves
+            continue
         if _objects(s, "table") and len(tableware(s)) >= want:
             return s
         time.sleep(2.0)
-        s = _summary(api)
     return s
 
 
