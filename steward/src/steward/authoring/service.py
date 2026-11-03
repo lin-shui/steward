@@ -360,9 +360,10 @@ KITCHEN_ASSETS = {
 def cobot_spec() -> dict:
     """The Cobot Magic workstation: the twin parked at a tabletop, a bowl and a plate on it.
 
-    The table's near edge sits at x = 0.38, just in front of the chassis (half-length 0.34), so
-    the twin works the band its arms can reach over the edge (measured: x 0.38-0.60 at y +-0.25,
-    strictly vertical only in the nearest part of it).
+    The table's near edge sits at x = 0.40, just in front of the chassis (half-length 0.34), so
+    the twin works the band its arms can reach over the edge (measured: x 0.40-0.60 at y +-0.45,
+    strictly vertical only in the nearest part of it). The bowl and the plate stand on the same
+    arm's side: the errand is one arm's job, pick and place both.
     """
     return {
         "name": "cobot-table",
@@ -370,10 +371,11 @@ def cobot_spec() -> dict:
             {"id": "w:room", "asset": "cobot-room", "at": {"x": 0.0, "y": 0.0}},
             {"id": "w:table-1", "asset": "cobot-table", "at": {"x": 0.85, "y": 0.0}},
             {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
-            # Table centre is (0.85, 0); these land the tableware in the left arm's reachable band,
-            # where a strictly vertical tool can still descend (see tests/test_cobot_skills.py).
-            {"id": "w:bowl-1", "asset": "bowl", "on": "w:table-1", "offset": [-0.39, 0.20]},
-            {"id": "w:plate-1", "asset": "plate", "on": "w:table-1", "offset": [-0.27, -0.22]},
+            # Table centre is (0.85, 0); both pieces stand on the left arm's side (the mission is
+            # one arm's errand), fully on the tabletop and clear of each other's footprint --
+            # verified against the solver, see tests/test_cobot_table.py.
+            {"id": "w:bowl-1", "asset": "bowl", "on": "w:table-1", "offset": [-0.35, 0.20]},
+            {"id": "w:plate-1", "asset": "plate", "on": "w:table-1", "offset": [-0.31, 0.42]},
         ],
         "regions": [{"id": "workcell", "label": "workcell", "polygon": [[-2, -2], [2, -2], [2, 2], [-2, 2]]}],
     }

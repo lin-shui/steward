@@ -88,11 +88,14 @@ def sighting_distance(pos, cam_pose: dict) -> np.ndarray:
 
 
 def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], dict],
-                    grip: str = "L_link6", retries: int = 2, rgbd: bool = False) -> dict:
+                    grip: str | None = None, retries: int = 2, rgbd: bool = False) -> dict:
     """Look at the table, pick up the bowl where the robot believes it is, and set it on the plate.
 
-    A missed grasp is fed back: the robot looks again before the next attempt, so a stale or wrong
-    belief costs one retry instead of the mission.
+    One arm does the whole errand, chosen by the side of the table the bowl stands on — the same
+    arm has to reach the plate too, so a layout that splits the pair across the two arms is a
+    scene error the first place will expose, not something to hand off mid-air. ``grip`` overrides
+    the choice. A missed grasp is fed back: the robot looks again before the next attempt, so a
+    stale or wrong belief costs one retry instead of the mission.
     """
     log: list[str] = []
     for attempt in range(1, retries + 1):
@@ -102,10 +105,11 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
             log.append(f"attempt {attempt}: not seen: {', '.join(missing)}")
             continue
         bowl, plate = seen["bowl"], seen["plate"]
+        arm, grip = _arm_for(float(bowl.pos[1])) if grip is None else (ARM_OF_GRIPPER[grip], grip)
         log.append(f"attempt {attempt}: bowl {_fmt(bowl.pos)} (e:{bowl.track_id}, {bowl.range_m:.2f} m), "
                    f"plate {_fmt(plate.pos)}")
-        if not _arm_can_reach(skills, bowl.pos):
-            log.append(f"attempt {attempt}: the bowl at {_fmt(bowl.pos)} is outside the left arm's workspace")
+        if not _arm_can_reach(skills, bowl.pos, arm):
+            log.append(f"attempt {attempt}: the bowl at {_fmt(bowl.pos)} is outside the {arm} arm's workspace")
             continue
         # Set the bowl down on the plate's top surface, from the sizes the robot measured: placing
         # it at the plate's *centre* puts the bowl's base through the plate, and every round then
@@ -114,9 +118,9 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
         target = [float(plate.pos[0]), float(plate.pos[1]),
                   plate_top + 0.5 * _extent(bowl.size, 2, 0.05) + 0.005]
         try:
-            _run(skills, "pick", {"grip": grip, "arm": "L", "at": [float(v) for v in bowl.pos]}, log)
+            _run(skills, "pick", {"grip": grip, "arm": arm, "at": [float(v) for v in bowl.pos]}, log)
             est.mark_held(bowl.track_id, gripper=grip, at=bowl.pos)
-            _run(skills, "place", {"grip": grip, "arm": "L", "at": target}, log)
+            _run(skills, "place", {"grip": grip, "arm": arm, "at": target}, log)
             est.release_held(at=target)
         except SkillStopped:
             raise
@@ -295,9 +299,10 @@ def _extent(size, axis: int, fallback: float) -> float:
     return value if value > 1e-4 else fallback
 
 
-def _arm_can_reach(skills: CobotSkills, pos: np.ndarray) -> bool:
+def _arm_can_reach(skills: CobotSkills, pos: np.ndarray, arm: str = "L") -> bool:
     """A crude gate before commanding: is this anywhere near the arm's measured workspace?"""
-    return 0.10 <= float(pos[0]) <= 0.60 and 0.02 <= float(pos[1]) <= 0.55 and 0.55 <= float(pos[2]) <= 1.05
+    y = float(pos[1]) * (1.0 if arm == "L" else -1.0)
+    return 0.10 <= float(pos[0]) <= 0.60 and 0.02 <= y <= 0.55 and 0.55 <= float(pos[2]) <= 1.05
 
 
 def _holding(skills: CobotSkills, grip: str) -> bool:
