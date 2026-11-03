@@ -146,6 +146,7 @@ class CobotEgoRuntime:
                                          **self.mission_kwargs)
         except Exception as exc:  # noqa: BLE001 - a crashed round is a failed round
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "log": []}
+        self._settle(result)
         self.rounds += 1
         self.results.append(result)
         self.last_error = None if result.get("ok") else (result.get("error") or "the mission did not complete")
@@ -154,6 +155,20 @@ class CobotEgoRuntime:
         if self._running:
             self.estimator.reboot()
             self.report({"cobotEgo": "reboot", "reason": "the world's clock went back: new episode"})
+
+    def _settle(self, result: dict) -> None:
+        """Look once more where the round ended, so the belief says what is true now.
+
+        A round's last act is usually a release, and the belief only drops a held track when a
+        perception frame arrives after the gripper opened. Without a look here the round parks
+        with the load still believed in the hand -- and the Ego State shows the bowl riding up
+        with the retreating arm while it lies on the counter. This is also what a real operator
+        would ask for: look at what you did before you say you are done."""
+        frame, rgbd = self.frame_source()
+        try:
+            perceive(self.estimator, frame, frames=6 if rgbd else 4, rgbd=rgbd, pause_s=0.0)
+        except Exception as exc:  # noqa: BLE001 - a failed look must not bury the round's result
+            result.setdefault("log", []).append(f"settling look failed: {type(exc).__name__}: {exc}")
 
     def _idle_look(self) -> None:
         """No mission: keep looking so the Ego-State view shows what the twin believes."""

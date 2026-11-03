@@ -920,7 +920,13 @@ class EgoEstimator:
         arm that is actually holding it, and the other arm's gripper state says nothing about it.
         ``at`` is the pinch point the gripper closed at. Without it the offset is measured against
         this estimator's last-seen encoders, which for a body that only looks between moves is the
-        posture from *before* the approach -- the load would then hang half a metre from the hand."""
+        posture from *before* the approach -- the load would then hang half a metre from the hand.
+
+        A previous mark still standing when a new grasp is recorded cannot still be true -- the
+        gripper opened to take this load -- and no frame may ever arrive to clear it (skills run
+        without looks), so it is dropped here rather than left riding a parked arm forever."""
+        if track_id != self.held_id:
+            self._unmark_held(self.tracks.get(self.held_id))
         track = self.tracks[track_id]
         self.held_since = max(self.stamp, float(since) if since is not None else self.stamp)
         self.held_gripper = gripper
@@ -929,6 +935,29 @@ class EgoEstimator:
         track.held_offset = track.pos - closed_at
         track.recent.clear()  # it will be put down elsewhere
         self.held_id = track_id
+
+    def release_held(self, at: list[float] | None = None) -> None:
+        """Record the release, from the skill that just opened the gripper.
+
+        ``at`` is where the load was let go -- the place target. The robot knows what it did; the
+        belief should say so at once instead of waiting for a look that may be seconds away (or,
+        at the end of a round, never come). Without ``at`` the last known position stands and the
+        track is simply unsettled: the next look places it."""
+        track = self.tracks.get(self.held_id) if self.held_id else None
+        if track is not None and at is not None:
+            track.pos = np.asarray(at, dtype=float)
+        self._unmark_held(track)
+
+    def _unmark_held(self, track) -> None:
+        self.held_id = None
+        self.held_gripper = None
+        if track is None:
+            return
+        track.held = False
+        track.held_offset = None
+        track.voxels = None
+        track.settled = False  # it settles where it was put down; the next view places it
+        track.var = np.maximum(track.var, 0.02**2)
 
     def _read_grippers(self, frame: dict) -> None:
         """The gripper state this frame reports, for a single gripper or for one per arm.
@@ -951,21 +980,13 @@ class EgoEstimator:
     def _clear_held(self) -> None:
         if self.stamp < self.held_since - 1e-6:
             return  # this frame was rendered while the gripper was still open
-        gripper = self.held_gripper
-        if self.held_id and self.held_id in self.tracks:
-            track = self.tracks[self.held_id]
-            # It is where the hand let go of it, not where it was picked up: the arm carried it
-            # across the table, and a look taken after the release must recognise it there rather
-            # than find a second bowl at the old place.
-            if track.held_offset is not None:
-                track.pos = self.gripper_position(gripper) + track.held_offset
-            track.held = False
-            track.held_offset = None
-            track.voxels = None
-            track.settled = False  # it drops a little when released; the next view places it
-            track.var = np.maximum(track.var, 0.02**2)
-        self.held_id = None
-        self.held_gripper = None
+        track = self.tracks.get(self.held_id) if self.held_id else None
+        # It is where the hand let go of it, not where it was picked up: the arm carried it
+        # across the table, and a look taken after the release must recognise it there rather
+        # than find a second bowl at the old place.
+        if track is not None and track.held_offset is not None:
+            track.pos = self.gripper_position(self.held_gripper) + track.held_offset
+        self._unmark_held(track)
 
     def _follow_held(self) -> None:
         if self.held_id and self.held_id in self.tracks:

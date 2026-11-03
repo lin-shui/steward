@@ -117,6 +117,7 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
             _run(skills, "pick", {"grip": grip, "arm": "L", "at": [float(v) for v in bowl.pos]}, log)
             est.mark_held(bowl.track_id, gripper=grip, at=bowl.pos)
             _run(skills, "place", {"grip": grip, "arm": "L", "at": target}, log)
+            est.release_held(at=target)
         except SkillStopped:
             raise
         except SkillFailed as exc:
@@ -125,6 +126,7 @@ def bowl_onto_plate(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], 
                 # Put the load down where it is: a retry that reaches for an object still in the
                 # gripper can only fail, and leaving it held hides the failure from the operator.
                 _run(skills, "open", {"gripper": grip}, log)
+                est.release_held()
                 log.append(f"attempt {attempt}: put the load down where it was held")
             _park(skills, grip, log)
             continue
@@ -164,6 +166,7 @@ def nest_bowls(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], dict]
                 # so the Ego State shows the bowl in the hand instead of leaving it on the table.
                 est.mark_held(small.track_id, gripper=grip, at=small.pos)
                 _run(skills, "place", {"arm": arm, "gripper": grip, "at": target}, log)
+                est.release_held(at=target)
                 placed.append(small.track_id)
                 # After it drops, the bowl rests on the floor it was released over.
                 base = Sighting(track_id=small.track_id, category=small.category,
@@ -175,6 +178,7 @@ def nest_bowls(est: EgoEstimator, skills: CobotSkills, frame: Callable[[], dict]
             log.append(f"attempt {attempt} failed: {exc}")
             if grip is not None and _holding(skills, grip):
                 _run(skills, "open", {"gripper": grip}, log)
+                est.release_held()
                 log.append(f"attempt {attempt}: put the bowl down where it was held")
             _park_both(skills, log)
             continue
@@ -218,12 +222,14 @@ def carry_to_station(est: EgoEstimator, skills: CobotSkills, frame: Callable[[],
             if lift is not None:
                 _run(skills, "lift", {"height": float(lift)}, log)
             _run(skills, "place", {"arm": arm, "gripper": grip, "at": [float(v) for v in place]}, log)
+            est.release_held(at=[float(v) for v in place])
         except SkillStopped:
             raise
         except SkillFailed as exc:
             log.append(f"attempt {attempt} failed: {exc}")
             if _holding(skills, grip):
                 _run(skills, "open", {"gripper": grip}, log)
+                est.release_held()
                 log.append(f"attempt {attempt}: put the bowl down where it was held")
             _park_both(skills, log)
             continue

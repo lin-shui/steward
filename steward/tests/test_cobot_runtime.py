@@ -68,6 +68,12 @@ def test_the_runtime_nests_the_bowls_over_the_port_and_reboots_with_the_world(ri
         assert green - red == pytest.approx(0.008, abs=0.006), f"green at {green:.3f} on red at {red:.3f}"
         assert blue - green == pytest.approx(0.008, abs=0.006), f"blue at {blue:.3f} on green at {green:.3f}"
         assert runtime.last_error is None
+        # The settling look after the round: nothing is believed held any more, and the bowl it
+        # put down is where it lies. Without that look the belief kept the load in the hand and
+        # the Ego State showed the bowl riding up with the parked arm, all the way to the reset.
+        assert runtime.estimator.held_id is None
+        assert not [t for t in runtime.estimator.tracks.values() if t.held], \
+            {t.id: t.category for t in runtime.estimator.tracks.values() if t.held}
 
         # Between rounds the twin keeps the Observer fed with its belief, as the mobile robot does.
         _pump_until(rig, lambda: rig.observer.latest_ego.get(ROBOT) is not None, timeout=10)
