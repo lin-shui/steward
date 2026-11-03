@@ -67,7 +67,7 @@ for line in sys.stdin:
     elif method == 'shutdown':
         send({'id': frame['id'], 'result': {}})
         break
-''')
+''', encoding="utf-8")
     return path
 
 
@@ -100,6 +100,15 @@ def test_missing_callback_does_not_advertise_question_support(runtime: Path, tmp
     with HarnessClient(config(), _launch_args=(sys.executable, str(runtime))) as client:
         initialize(client, tmp_path)
         assert client.request("stats", {}, response_model=Response).capabilities is None
+
+
+def test_callback_can_dismiss_a_question_without_a_provider_error(runtime: Path, tmp_path: Path) -> None:
+    with HarnessClient(config(lambda _request, _cancelled: {"cancelled": True}),
+                       _launch_args=(sys.executable, str(runtime))) as client:
+        initialize(client, tmp_path)
+        result = client.request("ask", {}, response_model=Response)
+        assert result.answer == {"cancelled": True}
+        assert result.error is None
 
 
 @pytest.mark.parametrize("action", ["cancel", "disconnect", "close"])

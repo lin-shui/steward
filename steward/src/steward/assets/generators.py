@@ -18,6 +18,15 @@ TEMPLATE_ID = "w:template"
 
 WOOD = [0.62, 0.45, 0.30, 1.0]
 LIGHT_WOOD = [0.80, 0.67, 0.50, 1.0]
+# Furniture of this kitchen in clearly different finishes, so that a robot seeing only part of a piece
+# can still tell the counter, sideboard, table and cabinet apart by colour.
+COUNTER_WHITE = [0.93, 0.93, 0.92, 1.0]
+COUNTER_TOP = [0.78, 0.79, 0.81, 1.0]
+WALNUT = [0.36, 0.22, 0.13, 1.0]
+WALNUT_DARK = [0.27, 0.16, 0.09, 1.0]
+BIRCH = [0.86, 0.75, 0.56, 1.0]
+BIRCH_LEG = [0.74, 0.62, 0.44, 1.0]
+CABINET_BLUE = [0.40, 0.52, 0.66, 1.0]
 WALL = [0.92, 0.91, 0.88, 1.0]
 FLOOR = [0.55, 0.52, 0.48, 1.0]
 STEEL = [0.70, 0.72, 0.75, 1.0]
@@ -77,8 +86,8 @@ def building(width: float = 6.0, depth: float = 5.0, height: float = 2.6, wall: 
 def counter(width: float = 1.8, depth: float = 0.6, height: float = 0.9) -> Entity:
     """Fixed kitchen counter without openable parts."""
     top = 0.04
-    carcass = primitive("box", [width, depth, height - top], pose([0, 0, (height - top) / 2]), WOOD)
-    slab = primitive("box", [width + 0.02, depth + 0.02, top], pose([0, 0, height - top / 2]), STEEL)
+    carcass = primitive("box", [width, depth, height - top], pose([0, 0, (height - top) / 2]), COUNTER_WHITE)
+    slab = primitive("box", [width + 0.02, depth + 0.02, top], pose([0, 0, height - top / 2]), COUNTER_TOP)
     link = Link(id="body", name="counter", geometry={"collision": [carcass, slab]},
                 affordances=[exact("support-surface")])
     return _entity("counter", "object", "fixed", [link])
@@ -94,9 +103,9 @@ def sideboard(width: float = 1.4, depth: float = 0.45, height: float = 0.85, dra
     plinth = 0.06
     if drawer_width <= 0:
         geoms = [
-            primitive("box", [depth - 0.04, width - 0.04, plinth], pose([0, 0, plinth / 2]), WOOD),
-            primitive("box", [depth, width, height - top - plinth], pose([0, 0, plinth + (height - top - plinth) / 2]), LIGHT_WOOD),
-            primitive("box", [depth + 0.02, width + 0.02, top], pose([0, 0, height - top / 2]), WOOD),
+            primitive("box", [depth - 0.04, width - 0.04, plinth], pose([0, 0, plinth / 2]), WALNUT_DARK),
+            primitive("box", [depth, width, height - top - plinth], pose([0, 0, plinth + (height - top - plinth) / 2]), WALNUT),
+            primitive("box", [depth + 0.02, width + 0.02, top], pose([0, 0, height - top / 2]), WALNUT_DARK),
         ]
         link = Link(id="body", name="sideboard", geometry={"collision": geoms}, affordances=[exact("support-surface")])
         return _entity("sideboard", "object", "fixed", [link])
@@ -104,12 +113,12 @@ def sideboard(width: float = 1.4, depth: float = 0.45, height: float = 0.85, dra
     lower_top = height - top - drawer_height
     side_w = (width - drawer_width) / 2
     geoms = [
-        primitive("box", [depth - 0.04, width - 0.04, plinth], pose([0, 0, plinth / 2]), WOOD),
-        primitive("box", [depth, width, lower_top - plinth], pose([0, 0, plinth + (lower_top - plinth) / 2]), LIGHT_WOOD),
-        primitive("box", [depth + 0.02, width + 0.02, top], pose([0, 0, height - top / 2]), WOOD),
-        primitive("box", [depth, side_w, drawer_height], pose([0, drawer_width / 2 + side_w / 2, lower_top + drawer_height / 2]), LIGHT_WOOD),
-        primitive("box", [depth, side_w, drawer_height], pose([0, -drawer_width / 2 - side_w / 2, lower_top + drawer_height / 2]), LIGHT_WOOD),
-        primitive("box", [wall, drawer_width, drawer_height], pose([-depth / 2 + wall / 2, 0, lower_top + drawer_height / 2]), LIGHT_WOOD),
+        primitive("box", [depth - 0.04, width - 0.04, plinth], pose([0, 0, plinth / 2]), WALNUT_DARK),
+        primitive("box", [depth, width, lower_top - plinth], pose([0, 0, plinth + (lower_top - plinth) / 2]), WALNUT),
+        primitive("box", [depth + 0.02, width + 0.02, top], pose([0, 0, height - top / 2]), WALNUT_DARK),
+        primitive("box", [depth, side_w, drawer_height], pose([0, drawer_width / 2 + side_w / 2, lower_top + drawer_height / 2]), WALNUT),
+        primitive("box", [depth, side_w, drawer_height], pose([0, -drawer_width / 2 - side_w / 2, lower_top + drawer_height / 2]), WALNUT),
+        primitive("box", [wall, drawer_width, drawer_height], pose([-depth / 2 + wall / 2, 0, lower_top + drawer_height / 2]), WALNUT),
     ]
     body = Link(id="body", name="sideboard", geometry={"collision": geoms}, affordances=[exact("support-surface")])
     drawer, slide = _drawer("body", depth, drawer_width, drawer_height, wall, lower_top)
@@ -144,12 +153,12 @@ def _drawer(parent: str, depth: float, opening_w: float, drawer_height: float, w
 def dining_table(width: float = 1.2, depth: float = 0.8, height: float = 0.75, mass: float = 25.0) -> Entity:
     """Free-standing table: heavy but movable."""
     top_t, leg = 0.04, 0.05
-    geoms = [primitive("box", [width, depth, top_t], pose([0, 0, height - top_t / 2]), LIGHT_WOOD)]
+    geoms = [primitive("box", [width, depth, top_t], pose([0, 0, height - top_t / 2]), BIRCH)]
     leg_h = height - top_t
     for sx in (-1, 1):
         for sy in (-1, 1):
             at = pose([sx * (width / 2 - leg), sy * (depth / 2 - leg), leg_h / 2])
-            geoms.append(primitive("box", [leg, leg, leg_h], at, WOOD))
+            geoms.append(primitive("box", [leg, leg, leg_h], at, BIRCH_LEG))
     link = Link(id="body", name="table", geometry={"collision": geoms}, inertial=exact({"mass": mass}),
                 material=exact({"friction": 0.8}), affordances=[exact("support-surface")])
     return _entity("table", "object", "free", [link])
@@ -161,11 +170,11 @@ def cabinet_with_drawer(width: float = 0.6, depth: float = 0.5, height: float = 
     wall = 0.02
     lower_h = height - drawer_height - wall
     carcass = [
-        primitive("box", [depth, width, lower_h], pose([0, 0, lower_h / 2]), WOOD),
-        primitive("box", [depth, width, wall], pose([0, 0, height - wall / 2]), WOOD),
-        primitive("box", [depth, wall, drawer_height], pose([0, width / 2 - wall / 2, lower_h + drawer_height / 2]), WOOD),
-        primitive("box", [depth, wall, drawer_height], pose([0, -width / 2 + wall / 2, lower_h + drawer_height / 2]), WOOD),
-        primitive("box", [wall, width, drawer_height], pose([-depth / 2 + wall / 2, 0, lower_h + drawer_height / 2]), WOOD),
+        primitive("box", [depth, width, lower_h], pose([0, 0, lower_h / 2]), CABINET_BLUE),
+        primitive("box", [depth, width, wall], pose([0, 0, height - wall / 2]), CABINET_BLUE),
+        primitive("box", [depth, wall, drawer_height], pose([0, width / 2 - wall / 2, lower_h + drawer_height / 2]), CABINET_BLUE),
+        primitive("box", [depth, wall, drawer_height], pose([0, -width / 2 + wall / 2, lower_h + drawer_height / 2]), CABINET_BLUE),
+        primitive("box", [wall, width, drawer_height], pose([-depth / 2 + wall / 2, 0, lower_h + drawer_height / 2]), CABINET_BLUE),
     ]
     base = Link(id="carcass", name="carcass", geometry={"collision": carcass}, affordances=[exact("support-surface")])
     drawer, slide = _drawer("carcass", depth, width, drawer_height, wall, lower_h)
@@ -217,6 +226,38 @@ def nesting_bowl(radius: float = 0.08, height: float = 0.06, mass: float = 0.3, 
                 material=exact({"friction": 0.9, "fragility": 0.6}),
                 affordances=[exact("graspable"), exact("container"), exact("stackable")])
     return _entity("bowl", "object", "free", [link])
+
+
+CARDBOARD = [0.78, 0.66, 0.48, 1.0]
+
+
+def printed_board(width: float = 0.12, depth: float = 0.12, thickness: float = 0.006, texture: str | None = None,
+                  back: list[float] | None = None, mass: float = 0.02, category: str = "board") -> Entity:
+    """Thin rigid board with a printed top face (``texture``: base64 PNG, image top towards local
+    +y) and a plain back and edges (``back``): a puzzle piece, a box lid, a card."""
+    link = Link(id="body", name=category.replace("_", " "),
+                geometry={"collision": [primitive("box", [width, depth, thickness], pose([0, 0, thickness / 2]),
+                                                  back or CARDBOARD, texture=texture)]},
+                inertial=exact({"mass": mass}), material=exact({"friction": 0.8, "fragility": 0.1, "contactTime": 0.005}),
+                affordances=[exact("graspable"), exact("flat")])
+    return _entity(category, "object", "free", [link])
+
+
+def open_box(width: float = 0.42, depth: float = 0.42, height: float = 0.05, wall: float = 0.01,
+             color: list[float] | None = None, mass: float = 0.3) -> Entity:
+    """Open-top box (a base and four walls) that can be carried with what lies in it and tipped
+    to pour it out."""
+    rgba = color or CARDBOARD
+    base_t = 0.015
+    geoms = [primitive("box", [width, depth, base_t], pose([0, 0, base_t / 2]), rgba)]
+    h = height - base_t
+    for x, y, sx, sy in ((width / 2 - wall / 2, 0, wall, depth), (-width / 2 + wall / 2, 0, wall, depth),
+                         (0, depth / 2 - wall / 2, width - 2 * wall, wall), (0, -depth / 2 + wall / 2, width - 2 * wall, wall)):
+        geoms.append(primitive("box", [sx, sy, h], pose([x, y, base_t + h / 2]), rgba))
+    link = Link(id="body", name="box", geometry={"collision": geoms}, inertial=exact({"mass": mass}),
+                material=exact({"friction": 0.8, "fragility": 0.1, "contactTime": 0.005}),
+                affordances=[exact("graspable"), exact("container"), exact("pourable")])
+    return _entity("box", "object", "free", [link])
 
 
 def wine_glass(bowl_radius: float = 0.04, bowl_height: float = 0.09, stem_height: float = 0.09,
@@ -353,7 +394,8 @@ def chair(seat: float = 0.46, seat_height: float = 0.46, back_height: float = 0.
 
 
 def steward_bot(camera_pitch_deg: float = 30.0, camera_fovy_deg: float = 60.0) -> Entity:
-    """Phase 0 mobile manipulator: planar base, vertical lift, horizontal reach, ideal gripper.
+    """Phase 0 mobile manipulator: planar base, vertical lift, horizontal reach, a two-axis wrist
+    (yaw about the vertical, roll about the arm) and an ideal gripper.
 
     The base collides with the world. The lift carriage, arm and gripper are visual-only links,
     so an approaching gripper never pushes the target: Phase 0 grasping is an ideal attach
@@ -405,21 +447,35 @@ def steward_bot(camera_pitch_deg: float = 30.0, camera_fovy_deg: float = 60.0) -
     joints = [
         _fixed("head_mount", "base", "head", pose([0.16, 0, 1.50])),
         Joint(id="lift", parent="base", child="carriage", type=exact("prismatic"), origin=exact(pose([0.22, 0, 0])),
-              axis=exact([0.0, 0.0, 1.0]), limits=exact({"lo": 0.30, "hi": 1.30}), q=exact([0.60]), qd=exact([0.0]),
+              axis=exact([0.0, 0.0, 1.0]), limits=exact({"lo": 0.0, "hi": 1.30}), q=exact([0.60]), qd=exact([0.0]),
               dynamics=exact({"damping": 250.0}),
-              actuator={"kind": "position", "limits": {"effort": 400.0, "velocity": 0.3}, "gains": {"kp": 6000.0}}),
+              actuator={"kind": "position", "limits": {"effort": 1600.0, "velocity": 1.2}, "gains": {"kp": 6000.0}}),
         Joint(id="reach", parent="carriage", child="arm", type=exact("prismatic"), origin=exact(pose([0.0, 0, 0])),
               axis=exact([1.0, 0.0, 0.0]), limits=exact({"lo": 0.05, "hi": 0.70}), q=exact([0.10]), qd=exact([0.0]),
               dynamics=exact({"damping": 150.0}),
-              actuator={"kind": "position", "limits": {"effort": 200.0, "velocity": 0.3}, "gains": {"kp": 2500.0}}),
-        _fixed("gripper_mount", "arm", "gripper", pose([0.04, 0, 0])),
+              actuator={"kind": "position", "limits": {"effort": 800.0, "velocity": 1.2}, "gains": {"kp": 2500.0}}),
+        _fixed("gripper_mount", "arm", "wrist", pose([0.04, 0, 0])),
+        # Both wrist axes pass through the gripper point, so turning them never moves what it holds
+        # away from the gripper: yaw turns a held object about the vertical, roll tips it (pouring).
+        Joint(id="wrist_yaw", parent="wrist", child="hand", type=exact("revolute"), origin=exact(pose()),
+              axis=exact([0.0, 0.0, 1.0]), limits=exact({"lo": -math.pi, "hi": math.pi}), q=exact([0.0]), qd=exact([0.0]),
+              dynamics=exact({"damping": 2.0}),
+              actuator={"kind": "position", "limits": {"effort": 40.0, "velocity": 6.0}, "gains": {"kp": 40.0, "armature": 0.02}}),
+        Joint(id="wrist_roll", parent="hand", child="gripper", type=exact("revolute"), origin=exact(pose()),
+              axis=exact([1.0, 0.0, 0.0]), limits=exact({"lo": -3.2, "hi": 3.2}), q=exact([0.0]), qd=exact([0.0]),
+              dynamics=exact({"damping": 2.0}),
+              actuator={"kind": "position", "limits": {"effort": 40.0, "velocity": 6.0}, "gains": {"kp": 40.0, "armature": 0.02}}),
     ]
     root_actuator = {
         "kind": "position",
-        "limits": {"effort": [900.0, 900.0, 250.0], "velocity": [0.5, 0.5, 1.0]},
+        "limits": {"effort": [3600.0, 3600.0, 1000.0], "velocity": [2.0, 2.0, 4.0]},
         "gains": {"kp": [8000.0, 8000.0, 900.0], "damping": [1500.0, 1500.0, 130.0]},
     }
-    return _entity("steward-bot", "robot", "planar", [base, head, carriage, arm, gripper], joints,
+    wrist = Link(id="wrist", name="wrist", geometry={"visual": [primitive("cylinder", [0.02, 0.03], None, STEEL)]},
+                 inertial=exact({"mass": 0.1}))
+    hand = Link(id="hand", name="hand", geometry={"visual": [primitive("box", [0.03, 0.03, 0.03], None, STEEL)]},
+                inertial=exact({"mass": 0.1}))
+    return _entity("steward-bot", "robot", "planar", [base, head, carriage, arm, wrist, hand, gripper], joints,
                    state_vars={"gripper": exact("open")}, root_actuator=root_actuator)
 
 
@@ -442,6 +498,8 @@ GENERATORS: dict[str, Callable[..., Entity]] = {
     "pill_bottle": pill_bottle,
     "perfume_bottle": perfume_bottle,
     "chair": chair,
+    "printed_board": printed_board,
+    "open_box": open_box,
     "steward_bot": steward_bot,
 }
 # The agilex embodiment's generator lives in its own module (it imports these constants), so it is

@@ -78,3 +78,11 @@ def test_a_perception_fault_pauses_the_world_until_acknowledged(kitchen_root, tm
         assert not host.sim.paused and host.active_perception_alerts() == []
     finally:
         host.stop()
+
+
+def test_a_large_object_the_robot_has_not_seen_since_it_was_moved_is_stale_memory_not_a_fault():
+    old_table = _ent("e:106", "table", [-1.4, 0.72, 0.37], [1.18, 0.8, 0.74])
+    old_table["pose"]["t"] = 40.0
+    assert _anomalies([old_table], set(), GT, {"p": [0.6, -2.0, 0.0]}, stamp=50.0) == []
+    old_table["pose"]["t"] = 48.0
+    assert [a["kind"] for a in _anomalies([old_table], set(), GT, {"p": [0.6, -2.0, 0.0]}, stamp=50.0)] == ["phantom"]

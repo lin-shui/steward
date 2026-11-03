@@ -27,7 +27,7 @@ def test_python_approval_controls_runtime_operation(tmp_path: Path, outcome: str
     marker = tmp_path / "approved.txt"
     patch = tmp_path / "approval.patch.yml"
     patch.write_text("- insert:\n    - id: approval-fixture\n      name: " + json.dumps(str(fixture))
-                     + "\n      config:\n        stopAfterApproval: true\n        path: " + json.dumps(str(marker)) + "\n")
+                     + "\n      config:\n        stopAfterApproval: true\n        path: " + json.dumps(str(marker)) + "\n", encoding="utf-8")
     # The client closes inside the executor lifetime, unblocking a reader even
     # when a regression prevents the expected request from arriving.
     with ThreadPoolExecutor(max_workers=1) as worker:
@@ -49,4 +49,4 @@ def test_python_approval_controls_runtime_operation(tmp_path: Path, outcome: str
             client.request("session/wait", {"sessionId": "main"}, response_model=EmptyResponse)
             assert marker.exists() is (outcome == "allowed-once")
             if marker.exists():
-                assert marker.read_text() == "approved\n"
+                assert marker.read_text(encoding="utf-8") == "approved\n"

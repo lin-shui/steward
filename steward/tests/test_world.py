@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -91,3 +92,37 @@ def test_render_without_main_thread_pump_times_out_without_blocking_physics(kitc
     sim.step_seconds(0.1)
     assert isinstance(errors[0], TimeoutError)
     assert sim.time == pytest.approx(t0 + 0.1, abs=0.01)
+
+
+def test_a_woken_control_loop_holds_the_clock_until_it_waits_again(kitchen_scene):
+    sim = WorldSim(kitchen_scene, speed=math.inf)
+    sim.start()
+    try:
+        woke = sim.wait_until(0.5, hold="loop")
+        assert 0.5 <= woke < 0.5 + sim.timestep * 1.5, "the world stops at the loop's wake-up time"
+        time.sleep(0.2)
+        assert sim.time == woke, "the world does not step while the woken loop runs"
+        sim.release("loop")
+        time.sleep(0.2)
+        assert sim.time > woke + 1.0, "released, the world runs on as fast as it can"
+    finally:
+        sim.stop()
+
+
+def test_with_freeze_idle_the_world_steps_only_while_a_caller_waits_for_time_to_pass(kitchen_scene):
+    sim = WorldSim(kitchen_scene, speed=math.inf, freeze_idle=True)
+    sim.start()
+    try:
+        def perceive_once():
+            sim.wait_until(0.5, hold="perception", pulls=False)
+            sim.release("perception")
+
+        threading.Thread(target=perceive_once, daemon=True).start()
+        time.sleep(0.2)
+        assert sim.time == 0.0, "a loop that only perceives does not make the world step"
+        assert sim.wait_until(1.0) >= 1.0, "a caller waiting for a later time makes it step"
+        t = sim.time
+        time.sleep(0.2)
+        assert sim.time == t, "then it stands still again"
+    finally:
+        sim.stop()

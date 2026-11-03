@@ -125,7 +125,7 @@
   <button id="pause">暂停</button>
   <select id="speed" title="仿真倍速">
     <option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option>
-    <option value="4">4×</option><option value="8">8×</option>
+    <option value="4">4×</option><option value="8">8×</option><option value="max">最快</option>
   </select>
   <select id="phase" title="功能级别：系统各模块运行在哪个 Phase 的实现上；运行中可切换，用于对比与调试"></select>
   <select id="fps" title="渲染帧率：世界视图（主机渲染线程）与自我态视图（机器人端渲染线程）按同一帧时钟以此帧率渲染；机器人相机按此帧率请求；控制台状态刷新最多每秒 5 次">
@@ -199,6 +199,8 @@
   <section class="card" id="planCard">
     <h2>机器人计划 <span class="pill" id="planState"></span><span class="sub" id="planMeta"></span></h2>
     <div id="planBody" class="task">机器人尚未发布计划</div>
+    <h2 style="margin-top:14px">当前思考 <span class="sub" id="thinkMeta"></span></h2>
+    <div id="thinkBody" class="task" style="white-space:pre-wrap"></div>
   </section>
   <div class="grid3">
     <section class="card">
@@ -489,6 +491,20 @@ document.querySelectorAll('[data-view]').forEach(btn => btn.onclick = () => {
 });
 
 // ------------------------------------------------------------------ refresh
+function renderThinking() {
+  const t = state.thinking && state.thinking[robotId];
+  if (!t) { $('thinkMeta').textContent = ''; $('thinkBody').textContent = '尚无思考记录'; return; }
+  if (t.error) { $('thinkMeta').textContent = '读取失败'; $('thinkBody').textContent = t.error; return; }
+  const entries = t.entries || [];
+  $('thinkMeta').textContent = entries.length
+    ? `　Ego Harness · 第 ${entries[entries.length - 1].step} 步${entries.some(e => e.active) ? ' · 思考中' : ''}` : '　Ego Harness';
+  const box = $('thinkBody');
+  box.innerHTML = entries.map(e => `<div class="${e.active ? 'plan-trouble' : ''}" style="margin:4px 0">${esc(e.text)}`
+    + (e.conclusion && e.conclusion.length ? `<div style="color:var(--muted);font-size:12px">结论：调用 ${e.conclusion.map(esc).join('、')}</div>` : '')
+    + `</div>`).join('') || '尚无思考记录';
+  box.scrollTop = box.scrollHeight;
+}
+
 async function refresh() {
   try {
     state = await api('GET', '/console/state');
@@ -504,13 +520,16 @@ async function refresh() {
     renderPhase(state.phase);
     renderBodies();
     renderRobotTarget();
-    $('task').textContent = state.task ? `任务：${state.task}` : '';
+    const goal = state.goal;
+    const progress = goal ? ` · 目标进度：最大拼合 ${goal.largestGroup}/${goal.entities}，相邻关系 ${goal.satisfied}/${goal.total}${goal.complete ? '（完成）' : ''}` : '';
+    $('task').textContent = state.task ? `任务：${state.task}${progress}` : '';
     $('pause').textContent = state.paused ? '继续' : '暂停';
     if (document.activeElement !== $('speed')) $('speed').value = String(state.speed);
     const ego = state.robots[robotId] && state.robots[robotId].ego;
     $('egoSub').textContent = ego ? `${robotId} 的自我态 · ES 版本 ${ego.version}` : '机器人自我态';
     if (!ego) $('egoEmpty').style.display = 'grid';
     drawOverlays(); drawMap(); drawMetrics(); drawEvents();
+    renderThinking();
   } catch (e) { showError(e); }
 }
 
@@ -943,11 +962,15 @@ $('load').onclick = async () => {
 };
 $('reset').onclick = async () => { try { await api('POST', '/wca/episode', { action: 'reset' }); refresh(); } catch (e) { showError(e); } };
 $('pause').onclick = async () => { try { await api('POST', '/wca/clock', { action: state && state.paused ? 'resume' : 'pause' }); refresh(); } catch (e) { showError(e); } };
-$('speed').onchange = async () => { try { await api('POST', '/wca/clock', { action: 'speed', value: Number($('speed').value) }); refresh(); } catch (e) { showError(e); } };
+$('speed').onchange = async () => { try { await api('POST', '/wca/clock', { action: 'speed', value: $('speed').value === 'max' ? 'max' : Number($('speed').value) }); refresh(); } catch (e) { showError(e); } };
 for (const id of ['showGtLabels', 'showEgoLabels', 'showSigma', 'showError']) $(id).onchange = drawOverlays;
 
 $('fps').value = String(fps);
-$('fps').onchange = () => { fps = Number($('fps').value); localStorage.setItem(FPS_KEY, String(fps)); postView(); };
+$('fps').onchange = () => {
+  fps = Number($('fps').value); localStorage.setItem(FPS_KEY, String(fps));
+  panes.world.index = panes.ego.index = null;  // tick numbers restart at a new rate
+  postView();
+};
 refresh().then(loadScenarios);
 paced(refresh, () => Math.min(fps, 5));
 ticked(() => pullFrame('world'));

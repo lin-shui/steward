@@ -16,6 +16,7 @@ the shared frame clock of :mod:`steward.viewloop`.
 
 from __future__ import annotations
 
+import math
 import queue
 import threading
 import time
@@ -33,7 +34,8 @@ from steward.world.console import CONSOLE_HTML, console_state
 from steward.phases import DEFAULT_PHASE, phase_catalog, phase_modules
 from steward.world.chat import ChatConfig, HarnessChat
 from steward.viewloop import ViewLoop, ViewSettings, frame_response
-from steward.world.sim import EditError, PerceptionConfig, WorldSim
+from steward.world.goals import evaluate as evaluate_goal
+from steward.world.sim import EditError, PerceptionConfig, WorldSim, speed_json
 from steward.world.world_view import WorldViewRenderer
 
 
@@ -57,12 +59,13 @@ class StewardHost:
     def __init__(self, root: Path | str, *, scenario: str | None = None, speed: float = 1.0, seed: int = 0,
                  run_dir: Path | None = None, wca_port: int = 0, robot_ports: dict[str, int] | None = None,
                  chat: ChatConfig | None = None, phase: str = DEFAULT_PHASE, bind_wait_s: float = 0.0,
-                 pause_on_perception_fault: bool = False):
+                 pause_on_perception_fault: bool = False, freeze_idle: bool = False):
         phase_modules(phase)
         self.phase = phase
         self.authoring = AuthoringService(root)
         self.chat = HarnessChat(chat, lambda: self.wca.url)
         self.speed = speed
+        self.freeze_idle = freeze_idle
         self.seed = seed
         self.run_dir = run_dir
         self.sim: WorldSim | None = None
@@ -97,9 +100,12 @@ class StewardHost:
         # console offers every body's scenes without a separate build command per root.
         self.authoring.ensure_scenario(name)
         scenario = self.authoring.load_scenario(name)
+        if scenario.get("phase"):
+            phase_modules(scenario["phase"])  # a scenario declares the level it was built for; unknown ones fail here
+            self.phase = scenario["phase"]
         if self.sim is not None:
             self.sim.stop()
-        self.sim = WorldSim(scenario["sceneState"], speed=self.speed, seed=self.seed,
+        self.sim = WorldSim(scenario["sceneState"], speed=self.speed, seed=self.seed, freeze_idle=self.freeze_idle,
                             perception=PerceptionConfig(mode=phase_modules(self.phase)["perception"]))
         self.scenario = scenario
         self.embodiments = scenario_embodiments(scenario)
@@ -139,6 +145,15 @@ class StewardHost:
 
     def phase_state(self) -> dict:
         return {"level": self.phase, "levels": phase_catalog()}
+
+    def goal_progress(self) -> dict | None:
+        """Progress towards the loaded scenario's ``goal`` from the World State, or None without one."""
+        goal = (self.scenario or {}).get("goal")
+        if goal is None or self.sim is None:
+            return None
+        sim = self.sim
+        with sim.lock:
+            return evaluate_goal(goal, sim._entity_pose)
 
     def _require_sim(self) -> WorldSim:
         if self.sim is None:
@@ -259,10 +274,10 @@ class StewardHost:
             elif action == "resume":
                 sim.paused = False
             elif action == "speed":
-                sim.speed = float(b["value"])
+                sim.speed = math.inf if b["value"] == "max" else float(b["value"])
             else:
                 raise HttpError(400, "action must be pause, resume or speed")
-            return {"paused": sim.paused, "speed": sim.speed, "t": sim.time}
+            return {"paused": sim.paused, "speed": speed_json(sim.speed), "t": sim.time}
 
         def render(q, b):
             sim = self._require_sim()
@@ -307,6 +322,7 @@ class StewardHost:
             ("GET", "/wca/status"): guard(lambda q, b: {"scenario": (self.scenario or {}).get("name"),
                                                         **(self.sim.status() if self.sim else {"loaded": False})}),
             ("GET", "/wca/scene"): guard(lambda q, b: self._require_sim().world_state()),
+            ("GET", "/wca/goal"): guard(lambda q, b: {"goal": self.goal_progress()}),
             ("POST", "/wca/clock"): guard(clock),
             ("POST", "/wca/episode"): guard(episode),
             ("GET", "/wca/render"): guard(render),
@@ -409,8 +425,11 @@ class StewardHost:
         try:
             status, body, headers = fetch(f"{url}/ego/view/frame" + (f"?after={int(after)}" if after else ""), timeout=2.0)
         except HttpError as exc:
-            if exc.status == 409 and self.view_settings is not None:
-                self._configure_robot_view(url)  # the robot restarted and lost its view settings
+            if exc.status == 409:
+                # The robot's view has no settings yet (it just started, or the console has not sent
+                # its camera yet): pass ours on if we have them; either way a frame follows shortly.
+                if self.view_settings is not None:
+                    self._configure_robot_view(url)
                 return NO_CONTENT
             raise
         except OSError as exc:
@@ -475,6 +494,19 @@ class StewardHost:
             image = sim.render(sim.robot_camera_name(rid), int(q.get("width", 320)), int(q.get("height", 240)), fmt=fmt)
             return Binary(image, IMAGE_FORMATS[fmt])
 
+        def clock_wait(q, b):
+            """Wait for the world clock (:meth:`WorldSim.wait_until`): ``until`` (or ``seconds`` from now;
+            neither: now), ``hold``, ``rank`` and ``pulls``. Answers 504 after ``timeoutS`` wall seconds (default 5)
+            without waking; the caller waits again."""
+            until = float(b["until"]) if "until" in b else None
+            hold = f"{rid}/{b['hold']}" if b.get("hold") else None
+            try:
+                return {"t": self._require_sim().wait_until(until, hold, timeout=float(b.get("timeoutS", 5.0)),
+                                                            rank=int(b.get("rank", 0)), seconds=float(b.get("seconds", 0.0)),
+                                                            pulls=bool(b.get("pulls", True)))}
+            except TimeoutError as exc:
+                raise HttpError(504, str(exc)) from exc
+
         def telemetry(q, b):
             if not isinstance(b, dict):
                 raise HttpError(400, "telemetry body must be an ego SceneState")
@@ -491,4 +523,6 @@ class StewardHost:
             ("GET", "/camera/rgb"): camera,
             ("POST", "/command"): lambda q, b: self._require_sim().command(rid, b or {}),
             ("POST", "/telemetry"): telemetry,
+            ("POST", "/clock/wait"): clock_wait,
+            ("POST", "/clock/release"): lambda q, b: self._require_sim().release(f"{rid}/{b['hold']}") or {},
         }

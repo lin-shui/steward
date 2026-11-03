@@ -27,7 +27,7 @@ for line in sys.stdin:
     elif msg.get("method") == "shutdown":
         print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {}}), flush=True)
         break
-''')
+''', encoding="utf-8")
     with HarnessClient(_launch_args=(sys.executable, str(peer))) as client:
         client.initialize(cwd=str(tmp_path), provider="mock", model="mock", approval_requests=enabled)
         payload = client.next_notification().payload

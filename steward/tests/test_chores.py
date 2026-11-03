@@ -63,7 +63,10 @@ def test_a_grasped_handle_slides_the_drawer_and_its_contents(chores_scene):
     assert sim.events[-1]["type"] == "grasp/handle"
     assert sim.sensors("w:robot-1")["gripper"]["holdingHandle"]
     bear_x = sim._entity_pose("w:teddy-bear")["p"][0]
-    _drive(sim, -1.85, 0.6, math.pi, 3)
+    for k in range(1, 31):  # pulled at the skills' drawer speed (0.3 m in about 0.9 s)
+        sim.command("w:robot-1", {"base": [-2.15 + 0.01 * k, 0.6, math.pi]})
+        sim.step_seconds(0.03)
+    sim.step_seconds(2)
     assert _drawer_q(sim, "w:sideboard-1") == pytest.approx(0.30, abs=0.02)
     assert sim._entity_pose("w:teddy-bear")["p"][0] - bear_x == pytest.approx(0.30, abs=0.03)
     sim.command("w:robot-1", {"gripper": "open"})
@@ -325,7 +328,7 @@ def test_a_doubtful_or_missing_role_is_looked_at_from_closer_before_acting(monke
     looked: list[str] = []
     monkeypatch.setattr(chores_mod, "_summary", lambda api: next(views))
     monkeypatch.setattr(chores_mod, "_approach_to_observe", lambda api, obj, distance=1.1: looked.append(obj["id"]))
-    monkeypatch.setattr(chores_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(chores_mod, "simtime_sleep", lambda api, seconds: None)
     runner = Chores("http://unused")
     monkeypatch.setattr(runner, "publish", lambda **changes: None)
     assert runner._confirmed("sideboard")["id"] == "e:21" and looked == ["e:21"]
@@ -396,3 +399,31 @@ def test_a_size_ordered_row_counts_from_either_end_of_the_table():
     assert check_table(scene([-0.3, 0.0, 0.3]), boxes)[0]
     assert check_table(scene([0.3, 0.0, -0.3]), boxes)[0], "smallest at the other end"
     assert not check_table(scene([0.0, -0.3, 0.3]), boxes)[0], "not in size order"
+
+
+def test_a_timed_out_request_fails_the_phase_instead_of_ending_the_loop(monkeypatch):
+    import steward.chores as chores_mod
+
+    failures: list[str] = []
+
+    class Stop(Exception):
+        pass
+
+    def timed_out(self):
+        raise TimeoutError("timed out")
+
+    def stop_after_failures(index, phase, message):
+        failures.append(message)
+        if len(failures) == 3:
+            raise Stop
+
+    monkeypatch.setattr(chores_mod, "_explore", lambda api, timeout_s: {"state": "succeeded"})
+    monkeypatch.setattr(chores_mod, "_wait_for_control", lambda api, on_wait=None: None)
+    monkeypatch.setattr(chores_mod.Chores, "publish", lambda self, **changes: None)
+    monkeypatch.setattr(chores_mod.Chores, "recover", lambda self, message="": None)
+    monkeypatch.setattr(chores_mod.Chores, "note_failure", lambda self, phase, message: None)
+    for name in ("arrange_on_table", "stack_on_sideboard", "swap_drawers"):
+        monkeypatch.setattr(chores_mod.Chores, name, timed_out)
+    with pytest.raises(Stop):
+        chores_mod.chores("http://unused", 0, on_failure=stop_after_failures)
+    assert failures == ["timed out"] * 3

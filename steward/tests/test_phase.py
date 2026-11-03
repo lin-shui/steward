@@ -257,3 +257,120 @@ def test_a_room_corner_seen_from_inside_is_concave_and_a_cabinet_front_is_not():
     table = np.vstack([top_t, legs])
     centre, size, _ = box_of(table)
     assert not _concave(table, centre, float(max(size[:2])), cam)
+
+
+def test_what_the_robot_holds_keeps_its_identity_while_carried():
+    from steward.assets.generators import steward_bot
+    from steward.ego.estimator import EgoEstimator, Track
+    from steward.ego.perception import Segment
+
+    est = EgoEstimator(robot_model=steward_bot().to_dict())
+    mug = Track(id="e:8", category_counts={"mug": 6.0, "cup": 2.0}, pos=np.array([-1.4, 0.3, 0.9]), var=np.full(3, 1e-4),
+                yaw=0.0, yaw_var=1e-3, size=np.array([0.1, 0.08, 0.1]), observations=8, first_seen=0.0, last_seen=0.0,
+                existence=1.0, held=True)
+    est.tracks[mug.id] = mug
+    table_view = Segment(points=np.zeros((40, 3)), color=np.array([0.87, 0.76, 0.57]), pixels=900, invalid_frac=0.0,
+                         border=True, range=1.0)
+    est._fuse_cloud(mug, {"seg": table_view, "centre": np.array([-1.4, 0.3, 0.6]), "size": np.array([1.2, 0.8, 0.3]),
+                          "yaw": 0.0, "probs": {"table": 1.0}, "footprint": 1.2}, np.array([0.0, 0.0, 1.4]))
+    assert mug.category == "mug" and "table" not in mug.category_counts
+
+
+def _remembered(oid: str, category: str, pos: list[float], size: list[float]):
+    from steward.ego.estimator import Track
+
+    return Track(id=oid, category_counts={category: 5.0}, pos=np.array(pos), var=np.full(3, 1e-4), yaw=0.0,
+                 yaw_var=1e-3, size=np.array(size), observations=20, first_seen=0.0, last_seen=0.0, existence=1.0)
+
+
+LOOKING_ALONG_X = {"p": [0.0, 0.0, 1.2], "q": [1.0, 0.0, 0.0, 0.0]}
+
+
+def _views(est, cam: dict, frame: dict, seconds: float, dt: float = 0.1) -> None:
+    for _ in range(int(round(seconds / dt))):
+        est.stamp += dt
+        est._decay_unseen_rgbd(cam, set(), frame)
+
+
+def test_an_established_object_is_dropped_only_after_free_views_from_two_places():
+    from steward.ego.estimator import EgoEstimator
+
+    est = EgoEstimator(robot_model=steward_bot().to_dict())
+    est.tracks["e:5"] = _remembered("e:5", "plant", [2.0, 0.0, 0.2], [0.24, 0.2, 0.4])
+    frame = {"depth": np.full((240, 320), 4.0, np.float32), "fovy": 60.0}  # the far wall, nothing in front of it
+    _views(est, LOOKING_ALONG_X, frame, 10.0)
+    assert "e:5" in est.tracks, "however long it looks from one place, one viewpoint does not delete a known object"
+    assert est.tracks["e:5"].existence >= 0.5
+    _views(est, {"p": [0.0, 0.5, 1.2], "q": [1.0, 0.0, 0.0, 0.0]}, frame, 0.6)
+    assert "e:5" not in est.tracks
+    assert est.dropped[-1]["id"] == "e:5" and est.dropped[-1]["reason"].startswith("seen through")
+
+
+def test_furniture_whose_top_is_still_in_view_gathers_no_evidence_of_absence():
+    from steward.ego.estimator import EgoEstimator
+
+    est = EgoEstimator(robot_model=steward_bot().to_dict())
+    est.tracks["e:7"] = _remembered("e:7", "table", [2.0, 0.0, 0.375], [1.2, 0.8, 0.75])
+    depth = np.full((240, 320), 4.0, np.float32)  # the floor and wall between the legs
+    depth[140:195, :] = 2.0  # the tabletop, at the table's distance
+    frame = {"depth": depth, "fovy": 60.0}
+    for cam_y in (0.0, 0.5, -0.5):
+        _views(est, {"p": [0.0, cam_y, 1.2], "q": [1.0, 0.0, 0.0, 0.0]}, frame, 10.0)
+    table = est.tracks["e:7"]
+    assert table.existence == 1.0 and not table.absent_views, "regions that went elsewhere are no evidence it is gone"
+
+
+def test_a_young_fragment_where_a_surface_is_seen_fades_away():
+    from steward.ego.estimator import EgoEstimator
+
+    est = EgoEstimator(robot_model=steward_bot().to_dict())
+    est.tracks["e:9"] = _remembered("e:9", "unknown", [2.0, 0.0, 0.2], [0.24, 0.2, 0.4])
+    est.tracks["e:9"].observations = 2
+    frame = {"depth": np.full((240, 320), 2.0, np.float32), "fovy": 60.0}
+    _views(est, LOOKING_ALONG_X, frame, 12.0)
+    assert "e:9" not in est.tracks and est.dropped[-1]["reason"].startswith("faded")
+
+
+def test_a_potted_plant_is_recognised_from_its_size_and_green_foliage():
+    measured = classify(np.array([0.22, 0.19, 0.40]), 0.01, np.array([0.305, 0.494, 0.231]))
+    assert max(measured, key=measured.get) == "plant", measured
+    big = classify(np.array([0.5, 0.45, 0.9]), 0.0, np.array([0.30, 0.50, 0.22]))
+    assert max(big, key=big.get) == "plant", f"a larger plant is still a plant: {big}"
+
+
+def test_a_well_known_object_folded_into_a_newer_larger_track_keeps_its_id():
+    from steward.ego.estimator import EgoEstimator
+
+    est = EgoEstimator(robot_model=steward_bot().to_dict())
+    est.tracks["e:3"] = _remembered("e:3", "table", [0.6, -0.9, 0.375], [1.2, 0.8, 0.75])
+    est.tracks["e:3"].observations = 40
+    est.tracks["e:90"] = _remembered("e:90", "table", [0.65, -0.9, 0.375], [1.4, 0.9, 0.75])
+    est.tracks["e:90"].observations = 3
+    est._merge_parts(np.array([-1.5, -1.2, 1.2]))
+    assert list(est.tracks) == ["e:3"] and est.tracks["e:3"].observations == 43
+    record = est.dropped[-1]
+    assert {k: record[k] for k in ("id", "observations", "reason", "into")} == \
+        {"id": "e:90", "observations": 3, "reason": "merged: part of a larger object", "into": "e:3"}
+
+
+def test_a_well_known_table_that_looks_hollow_from_afar_is_kept_while_an_unknown_box_is_not():
+    from steward.ego.estimator import EgoEstimator, _concave, _points
+
+    rng = np.random.default_rng(2)
+    # Only the far half of the top and the far legs: seen from (-1.4, -1.2) this reads as surfaces
+    # behind the box centre, as a room corner does.
+    top = np.stack([rng.uniform(0.6, 1.2, 300), rng.uniform(-0.9, -0.5, 300), np.full(300, 0.74)], axis=1)
+    legs = np.vstack([np.stack([np.full(40, 1.17), np.full(40, y), rng.uniform(0.0, 0.73, 40)], axis=1)
+                      for y in (-1.27, -0.53)])
+    voxels = np.unique(np.floor(np.vstack([top, legs]) / 0.01).astype(np.int32), axis=0)
+    cam = np.array([-1.4, -1.2, 1.5])
+    est = EgoEstimator(robot_model=steward_bot().to_dict())
+    est.odometry = {"x": -1.44, "y": -1.18, "yaw": 0.0}
+    table = _remembered("e:29", "table", [0.6, -0.9, 0.385], [1.19, 0.79, 0.74])
+    table.observations, table.voxels = 470, voxels
+    assert _concave(_points(voxels), table.pos, table.footprint, cam), "the case: it looks hollow from here"
+    unknown = _remembered("e:30", "unknown", [0.6, -0.9, 0.385], [1.19, 0.79, 0.74])
+    unknown.observations, unknown.voxels = 2, voxels.copy()
+    est.tracks = {"e:29": table, "e:30": unknown}
+    est._drop_impossible(cam)
+    assert list(est.tracks) == ["e:29"]

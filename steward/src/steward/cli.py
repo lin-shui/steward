@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import math
 import os
 import signal
 import subprocess
@@ -75,7 +76,7 @@ def cmd_build_kitchen(args) -> int:
     return 0
 
 
-def _host(args, run_dir: Path):
+def _host(args, run_dir: Path, start: bool = True):
     from steward.world.server import StewardHost
 
     _require_free({"console (world)": getattr(args, "wca_port", 0),
@@ -84,10 +85,12 @@ def _host(args, run_dir: Path):
     # ``"*"`` is the port the scenario's first robot gets, whatever its id: which body a scenario
     # puts in the world is its business, and the operator asked for a fixed robot port.
     ports = {"*": args.robot_port} if getattr(args, "robot_port", 0) else {}
-    return StewardHost(args.root, scenario=args.scenario, speed=args.speed, seed=args.seed, run_dir=run_dir,
+    host = StewardHost(args.root, scenario=args.scenario, speed=args.speed, seed=args.seed, run_dir=run_dir,
                        wca_port=args.wca_port, robot_ports=ports, chat=_chat_config(args),
                        phase=args.phase, bind_wait_s=getattr(args, "bind_wait", 0.0),
-                       pause_on_perception_fault=getattr(args, "pause_on_perception_fault", False)).start()
+                       pause_on_perception_fault=getattr(args, "pause_on_perception_fault", False),
+                       freeze_idle=args.freeze_idle)
+    return host.start() if start else host
 
 
 def _require_free(ports: dict[str, int]) -> None:
@@ -123,7 +126,10 @@ def _chat_config(args):
     world, robot = getattr(args, "world_harness", None), getattr(args, "robot_harness", None)
     if not world and not robot:
         return None
-    return ChatConfig(dsh=STEWARD_DIR / "dsh" / "node_modules" / ".bin" / "dsh", cwd=STEWARD_DIR,
+    _dsh_bin = STEWARD_DIR / "dsh" / "node_modules" / ".bin"
+    # Windows cannot exec the POSIX sh launcher; dsh.CMD is the npm-generated cmd wrapper
+    _dsh = _dsh_bin / ("dsh.CMD" if os.name == "nt" and (_dsh_bin / "dsh.CMD").exists() else "dsh")
+    return ChatConfig(dsh=_dsh, cwd=STEWARD_DIR,
                       env_file=STEWARD_DIR / ".env", world_home=Path(world) if world else None,
                       robot_home=Path(robot) if robot else None, ego_api=getattr(args, "ego_api", None))
 
@@ -214,7 +220,9 @@ class _EgoProcess:
             cmd += ["--task", task]
         if self.mission_config:
             cmd += ["--mission-config", json.dumps(self.mission_config, ensure_ascii=False)]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, encoding="utf-8",
+                                     errors="replace", start_new_session=True)  # NDJSON is UTF-8; a locale
+        # decode error here would silently kill the reader (and backpressure the child) on Windows
         first = self.proc.stdout.readline()
         if not first:
             raise SystemExit(f"the Ego Runtime process for {robot_url} ({body['ego']}) exited with status "
@@ -345,7 +353,9 @@ class EgoSupervisor:
 
 def cmd_up(args) -> int:
     run_dir = Path(args.root) / "runs" / time.strftime("%Y%m%d-%H%M%S")
-    host = _host(args, run_dir)
+    # The robot port serves from construction; the console's WCA opens only once the Ego APIs are
+    # attached, so the console never asks for an Ego-State view no robot provides yet.
+    host = _host(args, run_dir, start=False)
     egos = EgoSupervisor(args, run_dir)
     try:
         egos.reconcile(host)
@@ -357,6 +367,7 @@ def cmd_up(args) -> int:
     # before the world they poll is replaced, and the new bodies' runtimes follow.
     host.before_episode_load = lambda scenario: egos.depart(host, scenario)
     host.on_episode_loaded = lambda: egos.reconcile(host)
+    host.start()
     primary = next(iter(host.scenario["robots"]), None)
     print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
                       "robot": host.robot_servers[primary].url if primary else None, "egoApi": egos.primary_url(),
@@ -755,6 +766,10 @@ def cmd_chores(args) -> int:
     return 0 if ok else 1
 
 
+def _speed(text: str) -> float:
+    return math.inf if text == "max" else float(text)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="steward")
     parser.add_argument("--root", default=str(DEFAULT_ROOT), help="Steward data root (assets, scenes, runs)")
@@ -770,7 +785,10 @@ def main(argv: list[str] | None = None) -> int:
         # A cobot run picks its scenario from its task, so it has no fixed default here.
         p.add_argument("--scenario", default=None if name == "cobot" else defaults.get(name, "phase0-chores"))
         in_process = name in ("demo", "shuttle", "chores", "cobot")
-        p.add_argument("--speed", type=float, default=4.0 if in_process else 1.0)
+        p.add_argument("--speed", type=_speed, nargs="?", const=math.inf, default=4.0 if in_process else 1.0,
+                       help="simulation speed as a multiple of real time; without a value (or 'max'), as fast as possible")
+        p.add_argument("--freeze-idle", action="store_true",
+                       help="no world time passes while no robot acts, e.g. while the agents think")
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--phase", choices=sorted(PHASES), default=LATEST_PHASE,
                        help="phase level of the replaceable modules (switchable at run time from the console)")

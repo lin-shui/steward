@@ -54,7 +54,7 @@ def test_bundled_runtime_boots_the_sdk_profile(
 
     assert init.serverInfo is not None
     assert init.serverInfo.name == "deepseek-harness-sdk-runtime"
-    profile = json.loads((tmp_path / "home" / "profiles" / "sdk" / "package.json").read_text())
+    profile = json.loads((tmp_path / "home" / "profiles" / "sdk" / "package.json").read_text(encoding="utf-8"))
     assert profile["dsh"]["profile"]["bundles"] == [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-sdk-app",
@@ -70,7 +70,7 @@ def test_python_sdk_applies_an_ordered_profile_patch(
     patch.write_text(json.dumps([{
         "id": "system-prompt",
         "config": {"persona": "Python SDK ordered patch marker."},
-    }]))
+    }]), encoding="utf-8")
     harness = DeepSeekHarness(
         model="deepseek-v4-pro",
         cwd=str(tmp_path),
@@ -93,7 +93,7 @@ def test_bundled_runtime_surfaces_unbundled_plugin_failure(
     patch = tmp_path / "missing.patch.yml"
     patch.write_text(json.dumps([{
         "insert": [{"id": "missing", "name": "@deepseek-ai/dsh-does-not-exist"}],
-    }]))
+    }]), encoding="utf-8")
 
     client = _client(tmp_path, mode, monkeypatch, patch)
     client.start()

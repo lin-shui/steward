@@ -38,7 +38,7 @@ CATEGORY_RGB = {
     "plate": [0.95, 0.95, 0.95], "wall": [0.55, 0.58, 0.62], "drawer": [0.80, 0.67, 0.50],
     "wine_glass": [0.80, 0.92, 0.98], "mug": [0.12, 0.12, 0.13], "teddy_bear": [0.58, 0.38, 0.20],
     "scissors": [0.70, 0.72, 0.75], "toy_airplane": [0.95, 0.78, 0.10], "pistol": [0.12, 0.12, 0.13],
-    "pill_bottle": [0.94, 0.94, 0.92], "perfume_bottle": [0.95, 0.60, 0.75],
+    "pill_bottle": [0.94, 0.94, 0.92], "perfume_bottle": [0.95, 0.60, 0.75], "plant": [0.24, 0.52, 0.24],
 }
 COLOR_RGB = {
     "red": [0.85, 0.15, 0.15], "green": [0.15, 0.70, 0.25], "blue": [0.15, 0.35, 0.90], "black": [0.12, 0.12, 0.13],
@@ -73,9 +73,9 @@ def ego_render_scene(ego: dict, toward_camera: np.ndarray, room_center: list[flo
                     continue
             seen = (ent.get("stateVars", {}).get("color") or {}).get("value")
             rgb = COLOR_RGB.get(seen) or CATEGORY_RGB.get(ent["category"]["value"], DEFAULT_RGB)
-            alpha = 1.0 if ent["role"] == "environment" else 0.35 + 0.65 * float(ent.get("existence", 1.0))
+            alpha = 1.0 if ent["role"] == "environment" else 0.1 + 0.9 * float(ent.get("existence", 1.0))
             if ent["category"]["value"] == "unknown":
-                alpha = min(alpha, UNKNOWN_ALPHA)  # something unidentified must not hide what is behind it
+                alpha *= UNKNOWN_ALPHA  # something unidentified must not hide what is behind it
             for link in ent["body"]["links"]:
                 for geom in link["geometry"].get("collision", []):
                     geom["rgba"] = [*rgb, alpha]

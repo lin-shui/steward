@@ -41,7 +41,7 @@ for line in sys.stdin:
     else:
         raise AssertionError(method)
     print(json.dumps({'jsonrpc': '2.0', 'id': frame['id'], 'result': result}), flush=True)
-""".strip()
+""".strip(), encoding="utf-8"
     )
     with DeepSeekHarness(cwd=str(tmp_path), _launch_args=(sys.executable, str(runtime))) as harness:
         first = harness.start_session("first")

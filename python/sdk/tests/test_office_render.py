@@ -80,8 +80,8 @@ def test_workspace_retains_only_render_evidence_and_cleans_its_root(tmp_path: Pa
             batch = inputs / "cli-docx"
             batch.mkdir()
             content_image().save(batch / "page.png")
-            (batch / "manifest.json").write_text("{}")
-            (batch / "not-render-evidence.txt").write_text("excluded")
+            (batch / "manifest.json").write_text("{}", encoding="utf-8")
+            (batch / "not-render-evidence.txt").write_text("excluded", encoding="utf-8")
             (root / "runtime.bin").write_bytes(b"excluded")
             if fails:
                 raise AssertionError("render failed")

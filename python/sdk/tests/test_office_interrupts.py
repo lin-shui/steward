@@ -58,7 +58,7 @@ child.wait()
     finally:
         if pidfile.is_file():
             try:
-                os.killpg(int(pidfile.read_text()), signal.SIGKILL)
+                os.killpg(int(pidfile.read_text(encoding="utf-8")), signal.SIGKILL)
             except ProcessLookupError as error:
                 # The successful interruption path already terminated this group.
                 pass

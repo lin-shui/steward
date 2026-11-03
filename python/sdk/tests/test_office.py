@@ -31,10 +31,10 @@ def test_saved_output_and_literal_path_arguments(
     output = tmp_path / "saved workbook.xlsx"
     result = operation(source, output)
     assert result.output_path == output
-    assert output.read_text() == "converted fixture"
+    assert output.read_text(encoding="utf-8") == "converted fixture"
     assert result.backend == "wasm"
     assert result.missing_fonts == []
-    assert json.loads(office_cli.read_text()) == [operation.__name__, "--input", str(source), "--output", str(output)]
+    assert json.loads(office_cli.read_text(encoding="utf-8")) == [operation.__name__, "--input", str(source), "--output", str(output)]
 
 
 def test_render_images_reads_the_saved_manifest(office_cli: Path, tmp_path: Path) -> None:
@@ -47,7 +47,7 @@ def test_render_images_reads_the_saved_manifest(office_cli: Path, tmp_path: Path
     assert result.images[0].byte_length == 11
     assert result.missing_fonts == ["Fixture Sans"]
     assert result.input_path == tmp_path / "deck.pptx"
-    assert json.loads(office_cli.read_text())[5:] == [
+    assert json.loads(office_cli.read_text(encoding="utf-8"))[5:] == [
         "--pages", "1,3", "--dpi", "144", "--max-pages", "10", "--max-pixels", "1000000", "--max-dimension", "4096",
     ]
 
@@ -55,9 +55,9 @@ def test_render_images_reads_the_saved_manifest(office_cli: Path, tmp_path: Path
 def test_worksheet_selection_and_csv_sheet_keep_exact_names(office_cli: Path, tmp_path: Path) -> None:
     sheet = "收入 $Values"
     render_images("workbook.xlsx", tmp_path / "preview", sheet=sheet, range="A1:E9")
-    assert json.loads(office_cli.read_text())[5:] == ["--sheet", sheet, "--range", "A1:E9"]
+    assert json.loads(office_cli.read_text(encoding="utf-8"))[5:] == ["--sheet", sheet, "--range", "A1:E9"]
     convert("workbook.xlsx", tmp_path / "data.csv", sheet=sheet)
-    assert json.loads(office_cli.read_text())[5:] == ["--sheet", sheet]
+    assert json.loads(office_cli.read_text(encoding="utf-8"))[5:] == ["--sheet", sheet]
 
 
 def test_limits_and_fonts_reach_the_cli(office_cli: Path, tmp_path: Path) -> None:
@@ -68,7 +68,7 @@ def test_limits_and_fonts_reach_the_cli(office_cli: Path, tmp_path: Path) -> Non
         font_directories=[tmp_path / "Fonts One", tmp_path / "Fonts Two"],
         initial_font_families=["Fixture Sans", "中文字体"], font_fallbacks=[["Preferred", "Fallback"]],
     ))
-    assert json.loads(office_cli.read_text())[5:] == [
+    assert json.loads(office_cli.read_text(encoding="utf-8"))[5:] == [
         "--timeout-ms", "4567", "--max-input-bytes", "1024", "--max-output-bytes", "2048",
         "--max-image-resolution", "72", "--max-archive-entries", "10", "--max-uncompressed-bytes", "4096",
         "--max-font-files", "20", "--max-font-file-bytes", "8192", "--max-loaded-font-bytes", "16384",
@@ -92,7 +92,7 @@ def test_cli_failures_preserve_diagnostics_after_exit(
     assert failure.value.code == code
     assert failure.value.exit_code == exit_code
     assert not output.exists()
-    assert json.loads(office_cli.read_text())[-2:] == ["--timeout-ms", "100"]
+    assert json.loads(office_cli.read_text(encoding="utf-8"))[-2:] == ["--timeout-ms", "100"]
 
 
 @pytest.mark.parametrize("filename", ["invalid.docx", "invalid-bytes.docx"])

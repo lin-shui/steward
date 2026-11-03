@@ -93,7 +93,9 @@ class FrameClock:
         :returns: the tick number and its Unix time.
         """
         index = math.floor(self.now() * fps) + 1
-        if after is not None and index <= after:
+        # Skip past ``after`` only when it is a tick of this rate just ahead; a tick counted at another
+        # rate (or by a restarted clock) says nothing about when the next frame at this rate is due.
+        if after is not None and index <= after <= index + 2:
             index = after + 1
         return index, index / fps
 
@@ -152,10 +154,12 @@ class ViewLoop:
         return self.status()
 
     def latest(self, after: int | None = None) -> Frame | None:
-        """The newest frame if its tick is after ``after`` (``None`` otherwise); counts as viewing.
+        """The newest frame unless it is the one the viewer already has; counts as viewing. Ticks are
+        compared for identity, not order: a new rate (ticks are counted per frame period) or a
+        restarted renderer may give lower tick numbers than the viewer's last frame.
 
         :param after: the tick of the frame the viewer already has.
-        :returns: a newer frame or ``None``.
+        :returns: a frame the viewer does not have, or ``None``.
         """
         with self._lock:
             idle = time.monotonic() - self._last_view > self.idle_s
@@ -163,7 +167,7 @@ class ViewLoop:
             frame = self._frame
         if idle:
             self._wake.set()
-        return frame if frame is not None and (after is None or frame.index > after) else None
+        return frame if frame is not None and (after is None or frame.index != after) else None
 
     def status(self) -> dict:
         """Settings, measured frame rate over the last two seconds, last tick and render time."""
@@ -178,6 +182,7 @@ class ViewLoop:
     def _run(self) -> None:
         try:
             last: int | None = None
+            last_fps: float | None = None
             while self._running:
                 with self._lock:
                     settings = self._settings
@@ -186,8 +191,10 @@ class ViewLoop:
                     self._wake.wait(0.2)
                     self._wake.clear()
                     continue
+                if settings.fps != last_fps:
+                    last, last_fps = None, settings.fps  # ticks are counted per frame period
                 index, stamp = self.clock.next_tick(settings.fps, last)
-                delay = stamp - self.clock.now()
+                delay = min(stamp - self.clock.now(), 1.0 / settings.fps)
                 if delay > 0 and self._wake.wait(delay):
                     self._wake.clear()
                     continue  # new settings or a stop request: take the next tick with them

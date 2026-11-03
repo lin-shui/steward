@@ -31,6 +31,7 @@ CATEGORY_PRIORS: dict[str, dict] = {
     "perfume_bottle": {"role": "object", "root": {"free": 1.0}, "affordances": ["graspable", "container"], "fragility": 0.8},
     "chair": {"role": "object", "root": {"free": 0.95, "fixed": 0.05}, "affordances": ["graspable", "floor-standing"],
               "fragility": 0.1},
+    "plant": {"role": "object", "root": {"free": 1.0}, "affordances": ["graspable", "floor-standing"], "fragility": 0.3},
 }
 
 UNKNOWN_PRIOR = {"role": "object", "root": {"free": 0.5, "fixed": 0.5}, "affordances": [], "fragility": 0.5}

@@ -31,12 +31,13 @@ from steward.mission import (
     _safe_receipt,
     _wait_for_control,
     infeasible,
+    simtime_sleep,
 )
 from steward.net import HttpError, call
 
 TABLEWARE = ("bowl", "wine_glass", "mug", "cup")
 ROW_GAP = 0.06
-FLOOR_LEVEL_M = 0.15  # tableware whose base is lower than this lies on the floor, out of the lift's reach
+FLOOR_LEVEL_M = 0.15  # tableware whose base is lower than this lies on the floor
 FRESH_S = 45.0  # a piece planned into today's row must have been seen this recently
 TABLE_ROW_Y = 0.18
 VIEW_DISTANCE = 1.1
@@ -89,12 +90,12 @@ def _width(obj: dict) -> float:
 def tableware(summary: dict) -> list[dict]:
     """Tableware tracks ordered from the smallest to the largest footprint.
 
-    Things that cost a pick per round and never yield are left out: what lies on the floor (the
-    lift cannot reach down there, and a flat thing on the floor read as a bowl or plate is a mat
-    or a marker), what has not been seen for a while (a track outlives the view it came from),
-    and what stands on nothing (a cup at table height with no support under it is a corner of a
-    wall or the edge of a leg). When no support surface has been read at all, nothing is
-    supported, and then all of them are kept rather than none."""
+    Things that cost a pick per round and never yield are left out: what lies on the floor (a flat
+    thing on the floor read as a bowl or plate is a mat or a marker), what has not been seen for a
+    while (a track outlives the view it came from), and what stands on nothing (a cup at table
+    height with no support under it is a corner of a wall or the edge of a leg). When no support
+    surface has been read at all, nothing is supported, and then all of them are kept rather than
+    none."""
     items = [o for cat in TABLEWARE for o in _fresh_objects(summary, cat) if _bottom(o) >= FLOOR_LEVEL_M]
     supported = [o for o in items if o.get("on") is not None]
     return sorted(supported or items, key=_area)
@@ -172,7 +173,7 @@ def _move(api: str, obj: dict, place: dict, observe: dict, log: list, timeout_s:
     receipt = _safe_receipt(api, "place", place, observe, log)
     job = _run(api, receipt, timeout_s)
     log.append({"step": "place", "object": obj["id"], **place})
-    time.sleep(0.8)
+    simtime_sleep(api, 0.8)
     return job
 
 
@@ -215,7 +216,7 @@ def _view(api: str, furniture: dict, timeout_s: float) -> None:
     if not receipt["withinRiskLimit"]:
         raise infeasible(f"navigate to the front of {furniture['id']}", receipt)
     _run(api, receipt, timeout_s)
-    time.sleep(1.5)
+    simtime_sleep(api, 1.5)
 
 
 def _contents(summary: dict, holder: dict) -> list[str]:
@@ -315,7 +316,7 @@ class Chores:
                 self._doing(f"寻找{zh}：没有物体被认作{zh}，靠近最可能的候选{describe(cand)}（是{zh}的概率 "
                             f"{cand['categories'][role]:.2f}）观察")
                 _approach_to_observe(self.api, cand, distance=CONFIRM_DISTANCE)
-                time.sleep(1.5)
+                simtime_sleep(self.api, 1.5)
                 continue
             obj = max(found, key=lambda o: o["existence"])
             confidence = obj.get("roleConfidence", 1.0)
@@ -323,7 +324,7 @@ class Chores:
                 return obj
             self._doing(f"确认{describe(obj)}：它是{zh}的把握只有 {confidence:.2f}，先靠近观察")
             _approach_to_observe(self.api, obj, distance=CONFIRM_DISTANCE)
-            time.sleep(1.5)
+            simtime_sleep(self.api, 1.5)
         raise MissionFailed(f"no {role} in the ego state")
 
     def _search(self, role: str) -> None:
@@ -379,6 +380,7 @@ class Chores:
         table = self._confirmed("table")
         # Plan the row only after a close look: a transparent glass is not detected in every frame.
         _approach_to_observe(self.api, table, distance=1.3)
+        simtime_sleep(self.api, 2.0)
         s = _settle(self.api, seconds=25.0)
         table = _refresh(self.api, table)
         items = tableware(s)
@@ -466,7 +468,7 @@ class Chores:
             if not receipt["withinRiskLimit"]:
                 raise infeasible(f"open {drawer['id']}", receipt)
             _run(self.api, receipt, self.timeout_s)
-            time.sleep(1.5)
+            simtime_sleep(self.api, 1.5)
             self._step("drawers", f"打开{describe(furniture)} 的抽屉", object=drawer["id"])
         return _refresh(self.api, drawer)
 
@@ -526,9 +528,9 @@ class Chores:
                     _run(self.api, receipt, self.timeout_s)
             if any(word in message for word in PERCEPTION_FAILURES):
                 _explore(self.api, self.timeout_s)
-        except (MissionFailed, HttpError) as exc:
+        except (MissionFailed, HttpError, OSError) as exc:
             self.log.append({"step": "recover-failed", "error": str(exc)})
-            time.sleep(2.0)
+            simtime_sleep(self.api, 2.0)
 
     def escape(self) -> bool:
         """Break out of a failure loop: back away from whatever the base is pressed against, then
@@ -659,7 +661,7 @@ def chores(api: str, rounds: int, on_step=None, on_phase=None, on_failure=None, 
             try:
                 {"table": runner.arrange_on_table, "sideboard": runner.stack_on_sideboard,
                  "drawers": runner.swap_drawers}[phase]()
-            except (MissionFailed, HttpError) as exc:
+            except (MissionFailed, HttpError, OSError) as exc:
                 message = str(exc)
                 runner.publish(status={phase: "failed"}, state="recovering", difficulty=f"{PHASE_NAMES[phase]}：{message}")
                 if on_failure is not None:
@@ -684,7 +686,7 @@ def chores(api: str, rounds: int, on_step=None, on_phase=None, on_failure=None, 
                     runner.publish(state="escaping", difficulty=f"疑似活锁：{why}，先自救。\n自我诊断：{diagnosis.text}\n最近一次：{message}")
                     try:
                         runner.escape()
-                    except (MissionFailed, HttpError) as escape_exc:
+                    except (MissionFailed, HttpError, OSError) as escape_exc:
                         runner.log.append({"step": "escape-failed", "error": str(escape_exc)})
                     continue
                 escaped = False

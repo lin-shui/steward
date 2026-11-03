@@ -17,7 +17,7 @@ build_python_release = SimpleNamespace(**runpy.run_path(str(SCRIPT)))
 
 
 def test_repository_version_matches_root_package_json() -> None:
-    expected = json.loads((ROOT / "package.json").read_text())["version"]
+    expected = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
 
     assert build_python_release.repository_version() == expected
 
@@ -46,13 +46,13 @@ def test_release_tag_must_match_repository_version() -> None:
 
 
 def test_repository_version_accepts_a_prerelease(tmp_path: Path) -> None:
-    (tmp_path / "package.json").write_text('{"version":"1.2.3-rc.1"}\n')
+    (tmp_path / "package.json").write_text('{"version":"1.2.3-rc.1"}\n', encoding="utf-8")
 
     assert build_python_release.repository_version(tmp_path) == "1.2.3-rc.1"
 
 
 def test_repository_version_rejects_malformed_versions(tmp_path: Path) -> None:
-    (tmp_path / "package.json").write_text('{"version":"v1.2"}\n')
+    (tmp_path / "package.json").write_text('{"version":"v1.2"}\n', encoding="utf-8")
 
     with pytest.raises(ValueError, match="must be X.Y.Z"):
         build_python_release.repository_version(tmp_path)
@@ -87,7 +87,7 @@ def test_windows_wheel_tag_and_payload_are_x64_only() -> None:
 
 def test_platform_manifest_rejects_incomplete_entries(tmp_path: Path) -> None:
     manifest = tmp_path / "platforms.json"
-    manifest.write_text('{"macos-arm64":{"tag":"macosx_14_0_arm64"}}\n')
+    manifest.write_text('{"macos-arm64":{"tag":"macosx_14_0_arm64"}}\n', encoding="utf-8")
 
     with pytest.raises(ValueError, match="tag and executable fields"):
         build_python_release.load_platforms(manifest)
@@ -98,7 +98,7 @@ def test_stage_sdk_keeps_distribution_module_and_runtime_pin_distinct(tmp_path: 
 
     build_python_release.stage_sdk(destination, "1.2.3")
 
-    pyproject = (destination / "pyproject.toml").read_text()
+    pyproject = (destination / "pyproject.toml").read_text(encoding="utf-8")
     assert 'name = "deepseek-harness-sdk"' in pyproject
     assert 'version = "1.2.3"' in pyproject
     assert 'license = "MIT"' in pyproject
@@ -152,7 +152,7 @@ def test_stage_runtime_copies_platform_payload(
     resources = executable.with_name(executable.name.removeprefix("deepseek-harness-sdk-runtime-").removesuffix(".exe"))
     resource = resources / "office-skills/office-docx/SKILL.md"
     resource.parent.mkdir(parents=True)
-    resource.write_text("# Word documents\n")
+    resource.write_text("# Word documents\n", encoding="utf-8")
     destination = tmp_path / "staging"
 
     build_python_release.stage_runtime(destination, "1.2.3", executable, executable.name)
@@ -164,8 +164,8 @@ def test_stage_runtime_copies_platform_payload(
         if path.is_file()
     } == expected
     assert not (runtime_dir / office.name).exists()
-    assert (runtime_dir / resources.name / resource.relative_to(resources)).read_text() == "# Word documents\n"
-    pyproject = (destination / "pyproject.toml").read_text()
+    assert (runtime_dir / resources.name / resource.relative_to(resources)).read_text(encoding="utf-8") == "# Word documents\n"
+    pyproject = (destination / "pyproject.toml").read_text(encoding="utf-8")
     assert 'license = "MIT"' in pyproject
     assert 'license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]' in pyproject
     assert 'dsh = "deepseek_harness_runtime:main"' in pyproject

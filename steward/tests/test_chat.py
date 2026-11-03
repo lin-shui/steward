@@ -31,7 +31,7 @@ def _fake_dsh(tmp_path):
         "while [ $# -gt 0 ]; do case \"$1\" in --patch) cp \"$2\" \"$DSH_HOME/patch.yml\"; shift;; esac; "
         "echo \"$1\" >> \"$DSH_HOME/argv\"; shift; done\necho >> \"$DSH_HOME/argv\"\n"
         "cat > \"$DSH_HOME/stdin\"; pwd > \"$DSH_HOME/cwd\"\n"
-        f"cat <<'EOF'\n{lines}\nEOF\n")
+        f"cat <<'EOF'\n{lines}\nEOF\n", encoding="utf-8")
     script.chmod(0o755)
     return script
 
@@ -80,10 +80,10 @@ def test_world_chat_keeps_its_session_and_targets_this_hosts_wca(tmp_path):
     assert [m["role"] for m in state["messages"]] == ["user", "tool", "assistant", "user", "tool", "assistant"]
     assert {m["agent"] for m in state["messages"]} == {"world"}
     assert state["messages"][1]["status"] == "completed" and state["agents"]["world"]["sessionId"] == "session-1"
-    turns = (world / "argv").read_text().split("\n\n")
+    turns = (world / "argv").read_text(encoding="utf-8").split("\n\n")
     assert "--session-id" not in turns[0] and "--session-id\nsession-1" in turns[1]
-    assert "http://127.0.0.1:7999" in (world / "patch.yml").read_text()
-    assert (world / "stdin").read_text().startswith("操作员请求：")
+    assert "http://127.0.0.1:7999" in (world / "patch.yml").read_text(encoding="utf-8")
+    assert (world / "stdin").read_text(encoding="utf-8").startswith("操作员请求：")
     assert chat.state(since=state["messages"][-1]["id"])["messages"] == []
     assert not state["agents"]["robot"]["available"]
 
@@ -106,10 +106,10 @@ def test_robot_chat_takes_control_for_the_turn_and_gives_it_back(tmp_path):
     finally:
         ego.stop()
     assert calls == ["acquire", "release"]
-    patch = (robot / "patch.yml").read_text()
+    patch = (robot / "patch.yml").read_text(encoding="utf-8")
     assert "steward-ego-runtime" in patch and ego.url in patch and "owner: operator" in patch
-    assert (robot / "cwd").read_text().strip().endswith("robot-1/workspace"), "the robot runs in its empty workspace"
-    stdin = (robot / "stdin").read_text()
+    assert (robot / "cwd").read_text(encoding="utf-8").strip().endswith("robot-1/workspace"), "the robot runs in its empty workspace"
+    stdin = (robot / "stdin").read_text(encoding="utf-8")
     assert stdin.startswith("你是家用服务机器人") and "World State" not in stdin
     assert [m["agent"] for m in chat.state()["messages"]] == ["robot"] * 3
 
@@ -117,7 +117,7 @@ def test_robot_chat_takes_control_for_the_turn_and_gives_it_back(tmp_path):
 def test_stopping_a_robot_turn_ends_the_run_and_releases_control(tmp_path):
     robot = _home(tmp_path, "robot-1", "ego")
     script = tmp_path / "dsh"
-    script.write_text("#!/bin/sh\ncat > /dev/null\necho '{\"type\": \"session\", \"sessionId\": \"s-1\"}'\nsleep 30\n")
+    script.write_text("#!/bin/sh\ncat > /dev/null\necho '{\"type\": \"session\", \"sessionId\": \"s-1\"}'\nsleep 30\n", encoding="utf-8")
     script.chmod(0o755)
     calls = []
 

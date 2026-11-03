@@ -1,7 +1,8 @@
 """WSim: the authoritative World State simulation.
 
 WorldSim owns the MuJoCo model built from a World State scene, advances it at a fixed timestep
-(paced against wall time by ``speed``, or stepped explicitly), executes robot actuator commands,
+(paced against wall time by ``speed``, ``math.inf`` for as fast as possible, or stepped explicitly),
+keeps the clock robot control loops and client inputs wait on (:meth:`WorldSim.wait_until`), executes robot actuator commands,
 performs Phase 0 ideal grasping, generates each robot's sensor readings, and reads the physics
 state back as a World State ``SceneState``.
 
@@ -32,6 +33,7 @@ from steward.scene.schema import Relation, RigidTree, SceneState, exact
 
 _COLLISION_GROUPS = np.array([1, 0, 0, 1, 0, 0], dtype=np.uint8)
 HIDDEN_GROUP = 4  # not drawn by MuJoCo's default visualisation options
+HOLD_LEASE_S = 2.0  # wall seconds a hold may go unseen (its owner neither waiting nor done) before the world ignores it
 _JOINT_WIDTH = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3),
                 int(mujoco.mjtJoint.mjJNT_SLIDE): (1, 1), int(mujoco.mjtJoint.mjJNT_HINGE): (1, 1)}
 
@@ -41,6 +43,11 @@ _COLOR_NAMES = {
     "white": (0.95, 0.95, 0.96), "gray": (0.60, 0.62, 0.65), "brown": (0.58, 0.40, 0.24), "beige": (0.80, 0.67, 0.50),
     "yellow": (0.90, 0.85, 0.20),
 }
+
+
+def speed_json(speed: float) -> float | str:
+    """``speed`` as JSON: a multiple of real time, or ``"max"`` for as fast as possible."""
+    return "max" if speed == math.inf else speed
 
 
 def color_name(rgba) -> str:
@@ -83,6 +90,17 @@ class GraspConfig:
     handle_kd: float = 120.0
 
 
+def _under(obb, point: np.ndarray) -> bool:
+    """Whether ``point`` lies over the footprint of an oriented box."""
+    local = matrix_from_quat(obb.quat).T @ (np.asarray(point, float) - np.asarray(obb.center))
+    return abs(local[0]) <= obb.size[0] / 2 and abs(local[1]) <= obb.size[1] / 2
+
+
+def _is_pourable(ent) -> bool:
+    """A free object whose root link is ``pourable``: a container carried and tipped with its contents."""
+    return ent.rigid.root.value == "free" and any(a.value == "pourable" for a in ent.rigid.links[0].affordances)
+
+
 @dataclass
 class _RenderRequest:
     camera: str | dict
@@ -94,6 +112,16 @@ class _RenderRequest:
     done: threading.Event = field(default_factory=threading.Event)
     png: bytes = b""
     error: Exception | None = None
+
+
+@dataclass
+class _Hold:
+    """A robot control loop or client input the world clock waits for (see :meth:`WorldSim.wait_until`)."""
+    step: int  # index of the world step it wakes at
+    rank: int
+    pulls: bool = True  # with ``freeze_idle``, a waiting hold that pulls lets the world step towards it
+    woken: bool = False
+    seen: float = field(default_factory=time.monotonic)  # wall time its owner last waited or woke
 
 
 @dataclass
@@ -143,10 +171,14 @@ def _robot_state(ent) -> _RobotState:
 class WorldSim:
     def __init__(self, scene: dict, *, timestep: float = 0.002, speed: float = 1.0, seed: int = 0,
                  perception: PerceptionConfig | None = None, grasp: GraspConfig | None = None,
-                 overview_camera: dict | None = None):
+                 overview_camera: dict | None = None, freeze_idle: bool = False):
         self._initial_scene = copy.deepcopy(scene)
         self.timestep = timestep
         self.speed = speed
+        # The world stands still while no one waits for world time to pass: no robot acts and no
+        # client sleeps, e.g. while the agents think.
+        self.freeze_idle = freeze_idle
+        self._pulling_waits = 0  # callers of wait_until without a hold, waiting for a later step
         # Steps per locked batch when the loop is behind: short batches keep robot commands within
         # 50 ms of simulated time even when the physics cannot keep up with the requested speed.
         self.max_batch = 25
@@ -155,6 +187,7 @@ class WorldSim:
         self._seed = seed
         self._overview = overview_camera
         self.lock = threading.RLock()
+        self._clock = threading.Condition(self.lock)
         self._thread: threading.Thread | None = None
         self._running = False
         self.paused = False
@@ -176,6 +209,7 @@ class WorldSim:
         for renderer in getattr(self, "_renderers", {}).values():
             close_renderer(renderer)
         self._epoch = getattr(self, "_epoch", 0) + 1
+        self._holds: dict[str, _Hold] = {}
         self._renderers: dict[tuple[int, int], mujoco.Renderer] = {}
         self._index_bodies()
         self.step_count = 0
@@ -379,11 +413,7 @@ class WorldSim:
                 if g.attached is not None and scene.find(g.attached) is None:
                     g.attached, g.rel = None, None
                 if g.attached is not None:
-                    for gid in range(self.model.ngeom):
-                        if self._body_entity.get(int(self.model.geom_bodyid[gid])) == g.attached:
-                            g.saved_contacts[gid] = (int(self.model.geom_contype[gid]), int(self.model.geom_conaffinity[gid]))
-                            self.model.geom_contype[gid] = 0
-                            self.model.geom_conaffinity[gid] = 0
+                    self._suspend_contacts(rs, g)
         self._epoch += 1
         mujoco.mj_forward(self.model, self.data)
 
@@ -424,36 +454,129 @@ class WorldSim:
 
     def _loop(self) -> None:
         """Pace simulation time against wall time. The anchor is re-taken after a pause, a speed
-        change or a reset, so none of them makes the simulation jump forward."""
+        change or a reset, so none of them makes the simulation jump forward. The world never steps
+        past the earliest wake-up time of a hold, nor at all while a woken hold runs (:meth:`wait_until`)."""
         wall0, sim0, speed0, epoch0 = time.perf_counter(), self.time, self.speed, self._epoch
         while self._running:
-            with self.lock:
-                now_sim, epoch = self.time, self._epoch
-            if self.paused or self.speed != speed0 or epoch != epoch0:
-                wall0, sim0, speed0, epoch0 = time.perf_counter(), now_sim, self.speed, epoch
-            if self.paused:
-                time.sleep(0.01)
-                continue
-            behind = sim0 + (time.perf_counter() - wall0) * speed0 - now_sim
-            if behind > self.timestep:
-                with self.lock:
-                    if self._epoch == epoch0:
-                        self.step(min(int(behind / self.timestep), self.max_batch))
-            else:
-                time.sleep(0.001)
+            with self._clock:
+                now, epoch = self.time, self._epoch
+                idle = self.freeze_idle and not self._pulled()
+                if self.paused or idle or self.speed != speed0 or epoch != epoch0:
+                    wall0, sim0, speed0, epoch0 = time.perf_counter(), now, self.speed, epoch
+                n = min(self.max_batch, self._hold_limit() - self._step_now())
+                if speed0 != math.inf:
+                    n = min(n, self._step_index(sim0 + (time.perf_counter() - wall0) * speed0) - self._step_now())
+                if self.paused or idle or n <= 0:
+                    self._clock.wait(0.01 if self.paused else 0.001)
+                    continue
+                self.step(n)
+                self._clock.notify_all()
+            # Python locks are not fair: running flat out, this thread would take the lock straight
+            # back and starve requests that need it (a robot registering its first hold).
+            time.sleep(0)
+
+    # ------------------------------------------------------------------ clock
+    def wait_until(self, t: float | None = None, hold: str | None = None, timeout: float | None = None,
+                   rank: int = 0, seconds: float = 0.0, pulls: bool = True) -> float:
+        """Block until the world reaches ``t`` (``None``: ``seconds`` from now); return the simulated time
+        then. A ``t`` already passed means now.
+
+        With ``hold``, the caller is a robot control loop or a client input. The world does not step
+        past ``t`` before the caller wakes, and not at all while a woken caller runs, until it waits
+        again or calls :meth:`release`. Callers wake one at a time in the order of ``(step, rank, hold)``,
+        where ``step`` is the first world step at or after ``t``, so what happens depends neither on
+        ``speed`` nor on thread timing nor on how ``t`` was rounded. With ``freeze_idle``, the world
+        steps only while a caller that ``pulls`` waits; one that does not (perception) only stops it. A hold whose owner is neither
+        waiting nor woken for ``HOLD_LEASE_S`` wall seconds is ignored.
+
+        A reset, a stop or a :meth:`release` of the hold ends the wait early. ``timeout`` wall seconds
+        without waking raise :class:`TimeoutError`; a hold then stays registered, so ``timeout=0``
+        registers it without waiting. Without the clock thread (:meth:`start`) the call steps the
+        world itself."""
+        end = None if timeout is None else time.monotonic() + timeout
+        with self._clock:
+            epoch = self._epoch
+            step = max(self._step_now(), self._step_index(self.time + seconds if t is None else t))
+            if self._thread is None and step > self._step_now():
+                self.step(step - self._step_now())
+            if hold is not None:
+                self._holds[hold] = _Hold(step, rank, pulls)
+                self._clock.notify_all()
+            pulling = hold is None and pulls and step > self._step_now()
+            self._pulling_waits += pulling
+            try:
+                self._wait_due(step, hold, epoch, end)
+            finally:
+                self._pulling_waits -= pulling
+            if hold is not None and self._epoch == epoch and hold in self._holds:
+                self._holds[hold] = _Hold(step, rank, pulls, woken=True)
+            return self.time
+
+    def _wait_due(self, step: int, hold: str | None, epoch: int, end: float | None) -> None:
+        while (self._running and self._epoch == epoch and (hold is None or hold in self._holds)
+               and not self._due(step, hold)):
+            left = None if end is None else end - time.monotonic()
+            if left is not None and left <= 0:
+                raise TimeoutError(f"the world clock did not let {hold or 'the caller'} wake at step {step}")
+            if hold is not None:
+                self._holds[hold].seen = time.monotonic()
+            self._clock.wait(0.05 if left is None else min(0.05, left))
+
+    def release(self, hold: str) -> None:
+        """End ``hold``: the world no longer waits for its owner."""
+        with self._clock:
+            self._holds.pop(hold, None)
+            self._clock.notify_all()
+
+    def _step_index(self, t: float) -> int:
+        """Index of the first world step at or after time ``t``; a time within a millionth of a step
+        of a step counts as on it."""
+        return math.ceil(t / self.timestep - 1e-6)
+
+    def _step_now(self) -> int:
+        return round(self.time / self.timestep)
+
+    def _live_holds(self) -> dict[str, _Hold]:
+        now = time.monotonic()
+        return {name: h for name, h in self._holds.items() if now - h.seen < HOLD_LEASE_S}
+
+    def _due(self, step: int, hold: str | None) -> bool:
+        """True when the caller of :meth:`wait_until` may wake: ``step`` is reached and, for a hold, no
+        other hold runs and none waits ahead of it."""
+        if self._step_now() < step:
+            return False
+        if hold is None:
+            return True
+        live = self._live_holds()
+        if any(h.woken for name, h in live.items() if name != hold):
+            return False
+        mine = self._holds[hold]
+        return min((h.step, h.rank, name) for name, h in live.items() if not h.woken) >= (mine.step, mine.rank, hold)
+
+    def _pulled(self) -> bool:
+        """True when a caller waits for world time to pass (see ``freeze_idle``)."""
+        return self._pulling_waits > 0 or any(h.pulls and not h.woken for h in self._live_holds().values())
+
+    def _hold_limit(self) -> int | float:
+        """Step the world may advance to: the current one while a hold runs, else the earliest step a
+        hold waits for (``math.inf`` when none does)."""
+        live = self._live_holds().values()
+        if any(h.woken for h in live):
+            return self._step_now()
+        return min((h.step for h in live), default=math.inf)
 
     # --------------------------------------------------------------- commands
     def command(self, robot_id: str, cmd: dict) -> dict:
-        """Apply a robot actuator command: base [x, y, yaw], lift, reach, gripper "open"/"close",
-        or generic ``joints`` {joint id: target} for any actuated joint of any embodiment, and
-        ``gripper`` {grasp-point link id: "open"/"close"} for multi-gripper robots."""
+        """Apply a robot actuator command: base [x, y, yaw], lift, reach, wrist_yaw, wrist_roll,
+        gripper "open"/"close", or generic ``joints`` {joint id: target} for any actuated joint of
+        any embodiment, and ``gripper`` {grasp-point link id: "open"/"close"} for multi-gripper robots."""
         with self.lock:
             rs = self._robot(robot_id)
             names = self.build.names[robot_id]
             if "base" in cmd:
                 for key, value in zip(("root_x", "root_y", "root_yaw"), cmd["base"], strict=True):
                     self._set_ctrl(names.actuators[key], value)
-            for joint in ("lift", "reach"):
+            for joint in ("lift", "reach", "wrist_yaw", "wrist_roll"):
                 if joint in cmd:
                     self._set_ctrl(names.actuators[joint], cmd[joint])
             for name, value in (cmd.get("joints") or {}).items():
@@ -531,20 +654,28 @@ class WorldSim:
 
     def _try_attach(self, rs: _RobotState, g: _GripState, gripper_link: str) -> None:
         """Ideal grasp: attach the nearest free object within capture range that has nothing resting
-        on or in it (the top of a stack), or else grasp the nearest drawer handle."""
+        on or in it (the top of a stack) or is a pourable container (carried with what lies in it), or else
+        grasp the nearest drawer handle."""
         grip = np.asarray(self.grasp_point(rs.entity_id, gripper_link)["p"])
         supporting = {r.b["entity"] for r in self._relations()
                       if r.type == "supported-by" and self.template.entity(r.a["entity"]).rigid.root.value == "free"}
-        best, best_d = None, self.grasp.capture_radius
+        best, best_d, best_top = None, self.grasp.capture_radius, -math.inf
         for ent in self.template.entities:
-            if ent.role != "object" or ent.rigid.root.value != "free" or ent.id in supporting:
+            if ent.role != "object" or ent.rigid.root.value != "free":
+                continue
+            if ent.id in supporting and not (_is_pourable(ent) and not self._covered(ent.id)):
                 continue
             if any(other.holding_any(ent.id) for other in self.robots.values()):
                 continue
             obb = entity_obb(self.model, self.data, self.build.names[ent.id])
             d = float(np.linalg.norm(np.asarray(obb.center) - grip))
-            if d <= best_d:
-                best, best_d = ent.id, d
+            if d > self.grasp.capture_radius:
+                continue
+            # Closing from above, the gripper meets the topmost object under it first (a lid before
+            # the pieces in the box); elsewhere the nearest object.
+            top = obb.center[2] + obb.size[2] / 2 if _under(obb, grip) else -math.inf
+            if (top, -d) > (best_top, -best_d):
+                best, best_d, best_top = ent.id, d, top
         if best is None:
             handle = self._nearest_handle(grip)
             if handle is not None:
@@ -559,12 +690,30 @@ class WorldSim:
         obj_pose = {"p": self.data.xpos[body].tolist(), "q": self.data.xquat[body].tolist()}
         g.attached = best
         g.rel = pose_compose(pose_inverse(self.gripper_pose(rs.entity_id, gripper_link)), obj_pose)
+        self._suspend_contacts(rs, g)
+        self.events.append({"t": self.time, "type": "grasp/attach", "robot": rs.entity_id, "entity": best})
+
+    def _suspend_contacts(self, rs: _RobotState, g: _GripState) -> None:
+        """A carried object moves with the gripper and stops colliding, so it never snags on what it
+        is lifted from; a pourable container keeps colliding, so what lies in it stays in it."""
+        if g.attached is None or _is_pourable(self.template.entity(g.attached)):
+            return
         for gid in range(self.model.ngeom):
-            if self._body_entity.get(int(self.model.geom_bodyid[gid])) == best:
+            if self._body_entity.get(int(self.model.geom_bodyid[gid])) == g.attached:
                 g.saved_contacts[gid] = (int(self.model.geom_contype[gid]), int(self.model.geom_conaffinity[gid]))
                 self.model.geom_contype[gid] = 0
                 self.model.geom_conaffinity[gid] = 0
-        self.events.append({"t": self.time, "type": "grasp/attach", "robot": rs.entity_id, "entity": best})
+
+    def _covered(self, entity_id: str) -> bool:
+        """Whether something rests on top of an entity (above its top face), not merely in it."""
+        top = self.entity_obb(entity_id)
+        z_top = top.center[2] + top.size[2] / 2
+        for r in self._relations():
+            if r.type == "supported-by" and r.b["entity"] == entity_id:
+                other = self.entity_obb(r.a["entity"])
+                if other.center[2] - other.size[2] / 2 >= z_top - 0.01:
+                    return True
+        return False
 
     def _nearest_handle(self, grip: np.ndarray) -> dict | None:
         """The drawer handle (front-most geom of a ``graspable-handle`` link) within capture range."""
@@ -628,18 +777,28 @@ class WorldSim:
         g.attached, g.rel, g.saved_contacts = None, None, {}
 
     def _follow_attached(self) -> None:
+        """Move each held object rigidly with its gripper. It also takes the gripper's velocity, so
+        contacts carry what lies in a held container instead of letting it pass through."""
         for rs in self.robots.values():
             for gripper_link, g in rs.grippers.items():
                 if g.attached is None:
                     continue
-                target = pose_compose(self.gripper_pose(rs.entity_id, gripper_link), g.rel)
+                grip = self.gripper_pose(rs.entity_id, gripper_link)
+                target = pose_compose(grip, g.rel)
                 jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT,
                                         self.build.names[g.attached].root_joints[0])
                 qadr = self.model.jnt_qposadr[jid]
                 self.data.qpos[qadr : qadr + 3] = target["p"]
                 self.data.qpos[qadr + 3 : qadr + 7] = target["q"]
                 dadr = self.model.jnt_dofadr[jid]
-                self.data.qvel[dadr : dadr + 6] = 0.0
+                gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY,
+                                        self.build.names[rs.entity_id].bodies[gripper_link])
+                vel = np.zeros(6)
+                mujoco.mj_objectVelocity(self.model, self.data, mujoco.mjtObj.mjOBJ_BODY, gid, vel, 0)
+                omega, v_grip = vel[:3], vel[3:]
+                arm = np.asarray(target["p"]) - np.asarray(grip["p"])
+                self.data.qvel[dadr : dadr + 3] = v_grip + np.cross(omega, arm)
+                self.data.qvel[dadr + 3 : dadr + 6] = matrix_from_quat(target["q"]).T @ omega
 
     def _root_body(self, entity_id: str) -> int:
         names = self.build.names[entity_id]
@@ -1100,7 +1259,8 @@ class WorldSim:
             return {
                 "t": self.time,
                 "paused": self.paused,
-                "speed": self.speed,
+                "speed": speed_json(self.speed),
+                "freezeIdle": self.freeze_idle,
                 "entities": [{"id": e.id, "category": e.category.value, "role": e.role} for e in self.template.entities],
                 "robots": {rid: {"holding": next((g.attached for g in rs.grippers.values() if g.attached), None),
                                  "gripper": "closed" if any(g.closed for g in rs.grippers.values()) else "open",

@@ -27,9 +27,12 @@ from steward.scene.validate import validate_ego
 
 
 PHANTOM_FOOTPRINT_M = 1.0
+STALE_S = 5.0  # an ES object not seen for this long is remembered, not perceived: a phantom only counts
+# while the robot keeps seeing it (an object moved behind its back is stale memory, not a fault)
 ANOMALY_REPEATS = 3
 NAMES_ZH = {"wall": "墙", "table": "餐桌", "counter": "操作台", "cabinet": "柜子", "sideboard": "餐边柜", "chair": "椅子",
-            "bowl": "碗", "mug": "咖啡杯", "wine_glass": "高脚杯", "plate": "盘子", "drawer": "抽屉", "unknown": "未知物体"}
+            "bowl": "碗", "mug": "咖啡杯", "wine_glass": "高脚杯", "plate": "盘子", "drawer": "抽屉", "plant": "绿植",
+            "unknown": "未知物体"}
 
 
 class Observer:
@@ -122,7 +125,7 @@ class Observer:
             "wallsMatched": len(matches) - len(obj_matches),
             "matches": {e["id"]: g["id"] for e, g, _ in matches},
         })
-        anomalies = _anomalies(es_objs, {e["id"] for e, _, _ in matches}, gt, robot_pose)
+        anomalies = _anomalies(es_objs, {e["id"] for e, _, _ in matches}, gt, robot_pose, ego.get("stamp"))
         if anomalies:
             record["anomalies"] = [{k: a[k] for k in ("key", "kind", "entity")} for a in anomalies]
         self._watch(robot_id, anomalies)
@@ -190,8 +193,10 @@ def _within(centre: list[float], size: list[float], yaw: float, xy: list[float],
     return abs(c * dx + s * dy) <= size[0] / 2 + margin and abs(-s * dx + c * dy) <= size[1] / 2 + margin
 
 
-def _anomalies(es_objs: list[dict], matched: set[str], gt: list[dict], robot_pose: dict | None) -> list[dict]:
-    """Gross faults of one Ego-State against the world, each with an analysis for the operator."""
+def _anomalies(es_objs: list[dict], matched: set[str], gt: list[dict], robot_pose: dict | None,
+               stamp: float | None = None) -> list[dict]:
+    """Gross faults of one Ego-State against the world, each with an analysis for the operator. A
+    phantom counts only while the robot still sees it (last seen within ``STALE_S`` of ``stamp``)."""
     out = []
     for ent in es_objs:
         if ent.get("role") == "environment":
@@ -205,7 +210,9 @@ def _anomalies(es_objs: list[dict], matched: set[str], gt: list[dict], robot_pos
                         "message": f"机器人真实位置 ({robot_pose['p'][0]:.2f}, {robot_pose['p'][1]:.2f}) 落在 ES 的{name}内部",
                         "analysis": f"机器人以为自己站在{name}（{size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f} 米）里面，"
                                     "导航与停靠规划会全部失败；" + _contents_analysis(centre, size, gt)})
-        if ent["id"] not in matched and footprint >= PHANTOM_FOOTPRINT_M:
+        seen = ent["pose"].get("t")
+        fresh = stamp is None or seen is None or stamp - seen <= STALE_S
+        if ent["id"] not in matched and footprint >= PHANTOM_FOOTPRINT_M and fresh:
             out.append({"key": f"phantom:{ent['id']}", "kind": "phantom", "entity": ent["id"],
                         "message": f"ES 的{name}（{size[0]:.2f}×{size[1]:.2f}×{size[2]:.2f} 米，在 ({centre[0]:.2f}, {centre[1]:.2f})）"
                                    "在世界中没有对应物体",

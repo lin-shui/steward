@@ -32,4 +32,4 @@ def test_account_provider_signout_snapshot(tmp_path: Path) -> None:
         'reason': ending['data']['reason'],
     }
     expected = Path(__file__).with_name('expected') / 'account-provider-signout.json'
-    assert actual == json.loads(expected.read_text())
+    assert actual == json.loads(expected.read_text(encoding="utf-8"))

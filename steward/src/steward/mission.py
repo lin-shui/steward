@@ -74,6 +74,11 @@ def _refresh(api: str, obj: dict) -> dict:
     raise MissionFailed(f"{obj['id']} ({obj['category']}) is no longer in the ego state")
 
 
+def simtime_sleep(api: str, seconds: float) -> None:
+    """Let ``seconds`` of world time pass, e.g. for perception to settle after a motion."""
+    call("POST", f"{api}/clock/sleep", {"seconds": seconds}, timeout=3600.0)
+
+
 def _predict_until_safe(api: str, skill: str, params: dict, attempts: int = 5, settle_s: float = 1.0) -> dict:
     for _ in range(attempts):
         receipt = call("POST", f"{api}/ego/predict", {"skill": skill, "params": params})
@@ -81,7 +86,7 @@ def _predict_until_safe(api: str, skill: str, params: dict, attempts: int = 5, s
             return receipt
         if not receipt["feasible"]:
             raise infeasible(skill, receipt)
-        time.sleep(settle_s)
+        simtime_sleep(api, settle_s)
     raise MissionFailed(f"{skill} stayed above the risk limit: {receipt['risk']} {receipt['issues']}")
 
 
@@ -97,7 +102,7 @@ def _approach_to_observe(api: str, target: dict, distance: float = 1.1, timeout_
                        {"skill": "navigate", "params": {"x": x, "y": y, "yaw": math.atan2(ty - y, tx - x)}})
         if receipt["withinRiskLimit"]:
             _run(api, receipt, timeout_s)
-            time.sleep(1.5)
+            simtime_sleep(api, 1.5)
             return receipt
     return None
 
@@ -144,7 +149,7 @@ def _move(api: str, obj: dict, support: dict, log: list, timeout_s: float) -> No
     place = _safe_receipt(api, "place", {"on": support["id"]}, support, log)
     log.append({"step": "place", "on": support["id"], "risk": place["risk"], "spot": place["plan"]["spot"],
                 "message": _run(api, place, timeout_s)["message"]})
-    time.sleep(1.0)
+    simtime_sleep(api, 1.0)
     placed = next((o for o in call("GET", f"{api}/ego/summary")["objects"] if o["id"] == obj["id"]), None)
     if placed is None or placed["on"] != support["id"]:
         where = "lost" if placed is None else f"on {placed['on']} at {placed['position']}"
@@ -227,7 +232,7 @@ def _recover(api: str, supports: tuple[str, ...], objects: tuple[str, ...], log:
         log.append({"step": "recover-explore", "state": _explore(api, timeout_s)["state"]})
     except (MissionFailed, HttpError) as exc:
         log.append({"step": "recover-failed", "error": str(exc)})
-        time.sleep(2.0)
+        simtime_sleep(api, 2.0)
 
 
 def _shuttle_step(api: str, index: int, supports: tuple[str, ...], objects: tuple[str, ...], log: list,
