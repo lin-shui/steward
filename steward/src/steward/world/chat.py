@@ -252,7 +252,10 @@ class HarnessChat:
         """Unacknowledged robot alerts; each new one is also added to the transcript as an error."""
         try:
             active = call("GET", f"{self.config.ego_api}/ego/alerts", timeout=0.5)["active"]
-        except (HttpError, OSError):  # the robot's Ego API is down; nothing to show
+        except (HttpError, OSError, KeyError, TypeError):
+            # The robot's Ego API is down or answers in a shape we do not understand: nothing to
+            # show. A robot-side fault must not take the operator console's chat endpoint down
+            # with it -- that is what flashing an error on every poll looked like.
             return []
         with self._lock:
             for alert in active:

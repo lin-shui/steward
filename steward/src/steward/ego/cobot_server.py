@@ -66,7 +66,9 @@ class CobotEgoView:
             ("GET", "/ego/view/frame"): view_frame,
             ("GET", "/ego/summary"): lambda q, b: self.summary(),
             ("GET", "/ego/state"): lambda q, b: self._scene().to_dict(),
-            ("GET", "/ego/alerts"): lambda q, b: {"alerts": []},
+            # The twin raises no alerts of its own yet, but the shape is the contract: the World
+            # Harness reads ["active"], and a missing key took its whole chat endpoint down.
+            ("GET", "/ego/alerts"): lambda q, b: {"alerts": [], "active": []},
         }
 
     def summary(self) -> dict:

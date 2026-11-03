@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from steward.assets.cobot import cobot_magic
 from steward.authoring.service import AuthoringService, build_cobot_kitchen
 from steward.ego.cobot_runtime import CobotEgoRuntime
 from steward.ego.cobot_skills import MotionConfig
@@ -51,6 +52,21 @@ def test_the_runtime_reads_the_kind_of_sensor_data_the_world_delivers(rig) -> No
         rig.set_phase("phase1")
     with pytest.raises(ValueError, match="unknown mission"):
         CobotEgoRuntime(RobotLink(rig.robot_servers[ROBOT].url), task="fold-laundry")
+
+
+def test_the_twins_ego_api_speaks_the_alerts_shape_the_console_reads(rig) -> None:
+    """The World Harness reads ["active"] from /ego/alerts; the twin used to answer without it,
+    and the KeyError flashed on the console's chat poll forever."""
+    from steward.ego.cobot_server import cobot_ego_api
+    from steward.ego.estimator import EgoEstimator
+    from steward.net import call
+
+    live = cobot_ego_api(EgoEstimator(robot_model=cobot_magic().to_dict()), port=0).start()
+    try:
+        alerts = call("GET", f"{live.url}/ego/alerts")
+        assert "active" in alerts and isinstance(alerts["active"], list)
+    finally:
+        live.stop()
 
 
 def test_the_runtime_nests_the_bowls_over_the_port_and_reboots_with_the_world(rig) -> None:
