@@ -394,11 +394,15 @@ class EgoEstimator:
                 # inside its box and below its top; something standing on it starts at or above the top,
                 # and an open drawer reaches out of it.
                 m_bottom, m_top = m["centre"][2] - m["size"][2] / 2, m["centre"][2] + m["size"][2] / 2
-                part_of_large = track.footprint > 0.3 and m["footprint"] >= 0.3 \
+                # A tableware-sized region is a part of furniture only when it hangs inside the
+                # body: a bowl on a table whose top drifted up would join the table and lift its
+                # top further, round after round, but a lower fragment of a sideboard reaches far
+                # below the top while a thing resting on the surface stops within its own height.
+                below_top = track.top() - m_bottom
+                part_of_large = track.footprint > 0.3 \
+                    and (m["footprint"] >= 0.3 or below_top > m["size"][2]) \
                     and _footprint_inside(track, m, 0.05) \
                     and m_top <= track.top() + 0.1 and m_bottom < track.top() - 0.02
-                # (a tableware-sized region is never a part of furniture: a bowl on a table whose
-                # top drifted up would join the table and lift its top further, round after round)
                 if d > gate and not part_of_large:
                     continue
                 if track.held and m["footprint"] > HELD_LARGER * track.footprint + 0.05:
