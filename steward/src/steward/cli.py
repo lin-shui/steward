@@ -9,12 +9,12 @@
     steward shuttle                  carry objects around table → cabinet → sideboard, step by step
     steward chores                   sort tableware, stack it on the sideboard, swap drawer contents; repeat
     steward cobot                    the twin with its console in one process, rounds driven by world edits
+    steward services                 list the remote perception services and check that each is reachable
 """
 
 from __future__ import annotations
 
 import argparse
-import errno
 import json
 import math
 import os
@@ -26,10 +26,12 @@ import time
 from pathlib import Path
 
 from steward.embodiments import EMBODIMENTS
-from steward.phases import LATEST_PHASE, PHASES
+from steward.phases import LATEST_PHASE, PHASES, load_misnames
 
 STEWARD_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_ROOT = STEWARD_DIR / "var" / "steward"
+SEGMENTATION_CONFIG = STEWARD_DIR / "config" / "segmentation.toml"
+MISNAMES_CONFIG = STEWARD_DIR / "config" / "misnames.toml"
 
 # The Cobot Magic twin keeps its own ports: the kitchen scenario owns 7400/7410, and two worlds
 # that fight over one port is the most confusing failure there is -- the console comes up, but it
@@ -87,9 +89,10 @@ def _host(args, run_dir: Path, start: bool = True):
     ports = {"*": args.robot_port} if getattr(args, "robot_port", 0) else {}
     host = StewardHost(args.root, scenario=args.scenario, speed=args.speed, seed=args.seed, run_dir=run_dir,
                        wca_port=args.wca_port, robot_ports=ports, chat=_chat_config(args),
-                       phase=args.phase, bind_wait_s=getattr(args, "bind_wait", 0.0),
+                       phase=args.phase, fallback_phase=LATEST_PHASE, bind_wait_s=getattr(args, "bind_wait", 0.0),
                        pause_on_perception_fault=getattr(args, "pause_on_perception_fault", False),
-                       freeze_idle=args.freeze_idle)
+                       freeze_idle=args.freeze_idle,
+                       misnames=load_misnames(args.misnames_config) if getattr(args, "misnames_config", "") else None)
     return host.start() if start else host
 
 
@@ -105,14 +108,18 @@ def _require_free(ports: dict[str, int]) -> None:
             continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             # A port a previous run left in TIME_WAIT is free for us; only a live listener is not.
-            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Windows rebinds TIME_WAIT ports by default, and SO_REUSEADDR there would bind over a live listener.
+            if os.name != "nt":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("127.0.0.1", port))
             except OSError:
+                find = (f"netstat -ano | findstr :{port}" if os.name == "nt"
+                        else f"lsof -nP -iTCP:{port} -sTCP:LISTEN")
                 raise SystemExit(
                     f"steward: the {what} port {port} is already in use.\n"
                     f"  another steward run is probably still up; find it with\n"
-                    f"    lsof -nP -iTCP:{port} -sTCP:LISTEN\n"
+                    f"    {find}\n"
                     f"  then stop it, or pass a different port (--wca-port / --robot-port / --api-port).\n"
                     f"  the kitchen scenario owns 7400/7410/7420; `steward cobot` owns "
                     f"{COBOT_WCA_PORT}/{COBOT_ROBOT_PORT}") from None
@@ -150,11 +157,20 @@ def cmd_world(args) -> int:
     return 0
 
 
-def _start_ego(robot_url: str, api_port: int, out_dir: Path, bind_wait_s: float = 0.0):
+def _segmenter(config: str, root: str):
+    """The robot-side segmenter from ``config`` (``''``: none), caching results under ``<root>/ego/segmentation``."""
+    if not config:
+        return None
+    from steward.ego.segmenter import Segmenter
+
+    return Segmenter.from_files(Path(config), cache_dir=Path(root) / "ego" / "segmentation")
+
+
+def _start_ego(robot_url: str, api_port: int, out_dir: Path, bind_wait_s: float = 0.0, segmenter=None):
     from steward.ego.runtime import EgoRuntime, RobotLink
     from steward.ego.server import ego_api
 
-    runtime = EgoRuntime(RobotLink(robot_url), _robot_model(), out_dir=out_dir)
+    runtime = EgoRuntime(RobotLink(robot_url), _robot_model(), out_dir=out_dir, segmenter=segmenter)
     runtime.start()
     api = ego_api(runtime, port=api_port, bind_wait_s=bind_wait_s).start()
     return runtime, api
@@ -162,7 +178,8 @@ def _start_ego(robot_url: str, api_port: int, out_dir: Path, bind_wait_s: float 
 
 def cmd_ego(args) -> int:
     out_dir = Path(args.out_dir) if args.out_dir else Path(args.root) / "ego" / "observations"
-    runtime, api = _start_ego(args.robot_url, args.api_port, out_dir, args.bind_wait)
+    runtime, api = _start_ego(args.robot_url, args.api_port, out_dir, args.bind_wait,
+                              _segmenter(args.segmentation_config, args.root))
     print(json.dumps({"egoApi": api.url, "robot": args.robot_url}), flush=True)
     if args.parent_pid:
         _exit_with_parent(args.parent_pid)
@@ -192,11 +209,32 @@ def cmd_cobot_ego(args) -> int:
 
 
 def _exit_with_parent(parent_pid: int) -> None:
-    """Stop this process (as SIGTERM would) once the process that launched it is gone."""
+    """Stop this process (as SIGTERM would) once the process that launched it is gone.
+
+    On Windows, ``start_new_session=True`` breaks ``os.getppid()`` identity with the
+    launcher, so the old ``getppid() == parent_pid`` watch exited immediately (status 15).
+    Poll whether ``parent_pid`` still exists instead.
+    """
+    def parent_alive() -> bool:
+        if os.name == "nt":
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(parent_pid))
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        try:
+            os.kill(parent_pid, 0)
+        except OSError:
+            return False
+        return True
+
     def watch() -> None:
-        while os.getppid() == parent_pid:
+        while parent_alive():
             time.sleep(1.0)
-        os.kill(os.getpid(), signal.SIGTERM)
+        # raise_signal runs the SIGTERM handler on both systems; os.kill on Windows terminates
+        # the process at once, skipping the stoppers.
+        signal.raise_signal(signal.SIGTERM)
 
     threading.Thread(target=watch, name="parent-watch", daemon=True).start()
 
@@ -220,9 +258,13 @@ class _EgoProcess:
             cmd += ["--task", task]
         if self.mission_config:
             cmd += ["--mission-config", json.dumps(self.mission_config, ensure_ascii=False)]
+        if body["ego"] == "ego":  # only the mobile robot's runtime segments by itself
+            cmd += ["--segmentation-config", args.segmentation_config]
+        # The child writes its piped stdout in the locale encoding (GBK on Chinese Windows) unless told
+        # otherwise; the reader decodes UTF-8, so a locale decode error cannot kill it and backpressure the child.
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, encoding="utf-8",
-                                     errors="replace", start_new_session=True)  # NDJSON is UTF-8; a locale
-        # decode error here would silently kill the reader (and backpressure the child) on Windows
+                                     errors="replace", env=os.environ | {"PYTHONIOENCODING": "utf-8"},
+                                     start_new_session=True)
         first = self.proc.stdout.readline()
         if not first:
             raise SystemExit(f"the Ego Runtime process for {robot_url} ({body['ego']}) exited with status "
@@ -391,7 +433,8 @@ def cmd_demo(args) -> int:
         build_default_kitchen(AuthoringService(args.root))
     run_dir = Path(args.root) / "runs" / ("demo-" + time.strftime("%Y%m%d-%H%M%S"))
     host = _host(args, run_dir)
-    runtime, api = _start_ego(host.robot_servers["w:robot-1"].url, 0, run_dir / "ego")
+    runtime, api = _start_ego(host.robot_servers["w:robot-1"].url, 0, run_dir / "ego",
+                              segmenter=_segmenter(args.segmentation_config, args.root))
     t0 = time.monotonic()
     outcome: dict = {}
 
@@ -474,7 +517,7 @@ def cmd_cobot(args) -> int:
     robot_id = host.scenario["robots"][0]
     skills = CobotSkills(command=lambda cmd: sim.command(robot_id, cmd), state=lambda: sim.sensors(robot_id))
     est = EgoEstimator(robot_model=cobot_magic().to_dict())
-    rgbd = phase_modules(args.phase)["perception"] == "rgbd"
+    rgbd = phase_modules(host.phase)["perception"] == "rgbd"
     # The console's Ego State panel is rendered from the mission's own estimator, so the operator
     # watches the belief the skills are acting on -- not a second, independent one. Its self part
     # reads the twin's encoders on every frame, so the arm on that panel moves with the arm.
@@ -482,11 +525,11 @@ def cmd_cobot(args) -> int:
     host.attach_ego_api(robot_id, ego.url, skills=False)
 
     def sensed_frame() -> dict:
-        return decode_rgbd(sim.rgbd(robot_id, camera="top_camera")) if rgbd else sim.sensors(robot_id)
+        return decode_rgbd(sim.rgbd(robot_id, "top_camera")) if rgbd else sim.sensors(robot_id)
 
     print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
                       "robot": host.robot_servers[robot_id].url, "egoApi": ego.url,
-                      "task": host.scenario["task"], "phase": args.phase,
+                      "task": host.scenario["task"], "phase": host.phase,
                       "perception": "ground-truth" if args.ground_truth else ("rgbd" if rgbd else "detections"),
                       "runDir": str(run_dir)}, ensure_ascii=False), flush=True)
 
@@ -610,7 +653,8 @@ def cmd_shuttle(args) -> int:
             build_default_kitchen(AuthoringService(args.root))
         run_dir = Path(args.root) / "runs" / ("shuttle-" + time.strftime("%Y%m%d-%H%M%S"))
         host = _host(args, run_dir)
-        runtime, api = _start_ego(host.robot_servers["w:robot-1"].url, 0, run_dir / "ego")
+        runtime, api = _start_ego(host.robot_servers["w:robot-1"].url, 0, run_dir / "ego",
+                                  segmenter=_segmenter(args.segmentation_config, args.root))
         api_url = api.url
         def world_scene():
             return host.sim.world_state()
@@ -696,7 +740,8 @@ def cmd_chores(args) -> int:
             build_default_kitchen(AuthoringService(args.root))
         run_dir = Path(args.root) / "runs" / ("chores-" + time.strftime("%Y%m%d-%H%M%S"))
         host = _host(args, run_dir)
-        runtime, api = _start_ego(host.robot_servers["w:robot-1"].url, 0, run_dir / "ego")
+        runtime, api = _start_ego(host.robot_servers["w:robot-1"].url, 0, run_dir / "ego",
+                                  segmenter=_segmenter(args.segmentation_config, args.root))
         api_url = api.url
 
         def truth() -> tuple[dict, dict]:
@@ -766,6 +811,23 @@ def cmd_chores(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_services(args) -> int:
+    from steward import perception_services as ps
+
+    services = ps.load(Path(args.config))
+    healthy = True
+    for svc in services.values():
+        if args.no_check:
+            print(json.dumps({"service": svc.name, "title": svc.title, "urls": list(svc.urls), "docs": svc.docs},
+                             ensure_ascii=False))
+            continue
+        health = ps.check(svc)
+        healthy &= health.ok
+        print(json.dumps({"service": svc.name, "title": svc.title, "ok": health.ok, "url": health.url,
+                          "detail": health.detail}, ensure_ascii=False), flush=True)
+    return 0 if healthy else 1
+
+
 def _speed(text: str) -> float:
     return math.inf if text == "max" else float(text)
 
@@ -790,10 +852,13 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--freeze-idle", action="store_true",
                        help="no world time passes while no robot acts, e.g. while the agents think")
         p.add_argument("--seed", type=int, default=0)
-        p.add_argument("--phase", choices=sorted(PHASES), default=LATEST_PHASE,
-                       help="phase level of the replaceable modules (switchable at run time from the console)")
+        p.add_argument("--phase", choices=sorted(PHASES), default=None,
+                       help="phase level of the replaceable modules for every episode (switchable at run time "
+                            f"from the console); default: the scenario's declared level, else {LATEST_PHASE}")
         p.add_argument("--wca-port", type=int, default=COBOT_WCA_PORT if name == "cobot" else (0 if in_process else 7400))
         p.add_argument("--robot-port", type=int, default=COBOT_ROBOT_PORT if name == "cobot" else (0 if in_process else 7410))
+        p.add_argument("--misnames-config", default=str(MISNAMES_CONFIG),
+                       help="names the ideal detections report instead of true categories at the phase0-misnamed level; '' disables it")
         if not in_process:
             p.add_argument("--bind-wait", type=float, default=10.0,
                            help="seconds to wait for a fixed port still held by a service that just stopped")
@@ -809,6 +874,9 @@ def main(argv: list[str] | None = None) -> int:
                            help="Ego API of the robot, for robot tasks from the console chat")
         if name == "up":
             p.add_argument("--api-port", type=int, default=7420)
+        if name != "world":
+            p.add_argument("--segmentation-config", default=str(SEGMENTATION_CONFIG),
+                           help="robot-side segmenter settings, used at phase levels without world masks; '' disables it")
         if name == "chores":
             p.add_argument("--rounds", type=int, default=1, help="number of rounds; 0 repeats until Ctrl-C")
             p.add_argument("--api", help="Ego API of a running `steward up`; omit to run in-process")
@@ -834,6 +902,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--parent-pid", type=int, help="exit when this process is gone (set by `steward up`)")
         p.add_argument("--bind-wait", type=float, default=10.0,
                        help="seconds to wait for a fixed port still held by a service that just stopped")
+        if name == "ego":
+            p.add_argument("--segmentation-config", default=str(SEGMENTATION_CONFIG),
+                           help="robot-side segmenter settings, used at phase levels without world masks; '' disables it")
         if name == "cobot-ego":
             p.add_argument("--task", choices=COBOT_MISSIONS, default=None,
                            help="scripted mission the twin runs in its scene, round after round, each new "
@@ -842,11 +913,18 @@ def main(argv: list[str] | None = None) -> int:
                            help="JSON object of parameters for the mission (the scenario's "
                                 "`missionConfig`: station poses and the like)")
         p.set_defaults(fn=fn)
+    p = sub.add_parser("services")
+    p.add_argument("--config", default=str(STEWARD_DIR / "config" / "perception-services.toml"),
+                   help="perception services file")
+    p.add_argument("--no-check", action="store_true", help="only list the services, without contacting them")
+    p.set_defaults(fn=cmd_services)
     args = parser.parse_args(argv)
     try:
         return args.fn(args)
     except OSError as exc:
-        if exc.errno != errno.EADDRINUSE:
+        from steward.net import address_in_use
+
+        if not address_in_use(exc):
             raise
         raise SystemExit(f"steward: a port is already in use ({exc}); stop the other run or pass "
                          f"different --wca-port / --robot-port / --api-port values") from None

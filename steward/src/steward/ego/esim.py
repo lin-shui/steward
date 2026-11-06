@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -205,12 +206,14 @@ class Esim:
 
     # -------------------------------------------------------------- approach
     def _approach(self, es: SceneState, support: Entity, target_xy: tuple[float, float], height: float,
-                  exclude: set[str], load: Entity | None = None) -> dict:
+                  exclude: set[str], load: Entity | None = None,
+                  heading_issue: Callable[[float], str | None] | None = None) -> dict:
         """Choose the support side to dock at; return path, dock pose and reach, or raise.
 
         With ``load`` (a floor-standing object about to be picked) a side is only accepted when the
         robot can still turn at the pre-dock pose while carrying the load in front of it, so a
-        pick never leaves the robot boxed in."""
+        pick never leaves the robot boxed in. ``heading_issue`` rejects a side by the base heading
+        docked there (a wrist turn beyond its travel), with the reason it returns."""
         sbox, _, _ = entity_box(support)
         rx, ry, _ = self._robot_xy_yaw(es)
         c, s = math.cos(sbox.yaw), math.sin(sbox.yaw)
@@ -238,6 +241,10 @@ class Esim:
             nx, ny = c * normal[0] - s * normal[1], s * normal[0] + c * normal[1]
             ex, ey = sbox.cx + c * edge[0] - s * edge[1], sbox.cy + s * edge[0] + c * edge[1]
             yaw = math.atan2(-ny, -nx)
+            issue = heading_issue(yaw) if heading_issue is not None else None
+            if issue:
+                reasons.append(f"side {normal}: {issue}")
+                continue
             # Where the nearest dock pose collides, stand farther back and reach further.
             while True:
                 dock = (ex + nx * standoff, ey + ny * standoff)
@@ -384,7 +391,7 @@ class Esim:
         return self._held_relative(es)
 
     def _retreat(self, obstacles: list[Box2D], start: tuple[float, float], direction: tuple[float, float],
-                 yaw: float, carry: tuple, min_d: float, turn_carry: tuple | None = None) -> tuple[float, float] | None:
+                 yaw: float, carry: tuple | None, min_d: float, turn_carry: tuple | None = None) -> tuple[float, float] | None:
         """Nearest point at least ``min_d`` along ``direction`` (heading unchanged) that the robot can
         reach in a straight line with its load and where it has room to turn with it (judged with
         ``turn_carry`` when given)."""
@@ -401,7 +408,7 @@ class Esim:
 
     def _boxed_in(self, es: SceneState, obstacles: list[Box2D], carry: tuple | None) -> str | None:
         """When a carried load leaves no room to turn where the robot stands, say how to get out:
-        put the load down where it is."""
+        put the load down where it is, or, where it would then trap the base, on a surface."""
         if carry is None:
             return None
         rx, ry, ryaw = self._robot_xy_yaw(es)
@@ -410,8 +417,69 @@ class Esim:
             return None
         held = self._held(es)
         box, _, _ = entity_box(held)
+        _, trapped = self._put_down_here(es, held, obstacles)
+        if trapped:
+            return (f"carrying {held.id} the robot has no room to turn here ({blocked}), and putting it down here "
+                    f"would trap the base ({trapped}); set it on a surface within reach with place on=<surface id>")
         return (f"carrying {held.id} the robot has no room to turn here ({blocked}); put it down where it is with "
                 f"place at=[{box.cx:.2f}, {box.cy:.2f}] yaw={box.yaw:.2f}, then move without it")
+
+    def _release_reach(self, es: SceneState, held: Entity, rel: tuple) -> tuple[tuple, float | None]:
+        """The held footprint (robot frame) and wrist reach for setting ``held`` down on the floor.
+        An object that overhangs the base while carried would land on it, so the arm extends until
+        the object clears the front of the base, within its travel; the reach is None when the arm
+        stays as it is (the object already clears the base, the base drives over it, or the arm
+        cannot extend that far, which the release check then reports)."""
+        lx, ly, dyaw, hx, hy = rel
+        _, bottom, top = entity_box(held)
+        along = abs(math.cos(dyaw)) * hx + abs(math.sin(dyaw)) * hy
+        extend = self.half_x + 0.02 + along - lx
+        now = next((j.q.value[0] for j in self._self(es).rigid.joints if j.id == "reach" and j.q.value), None)
+        if top - bottom <= self.ground_clearance or extend <= 0 or now is None or now + extend > self.config.reach_max:
+            return rel, None
+        return (lx + extend, ly, dyaw, hx, hy), now + extend
+
+    def _put_down_here(self, es: SceneState, held: Entity, obstacles: list[Box2D]) -> tuple[dict, str | None]:
+        """Plan setting ``held`` down on the floor where it is now: the base backs off straight by
+        as much as the arm extends (see ``_release_reach``), so the object lands below where it is
+        held. Returns the plan's dock, pre-dock (the retreat after release) and reach, or the
+        reason it cannot be done."""
+        rel = self._held_relative(es)
+        rx, ry, ryaw = self._robot_xy_yaw(es)
+        box, _, _ = entity_box(held)
+        extended, reach = self._release_reach(es, held, rel)
+        back = (-math.cos(ryaw), -math.sin(ryaw))
+        shift = extended[0] - rel[0]
+        dock = (rx + back[0] * shift, ry + back[1] * shift)
+        placed = Box2D(held.id, box.cx, box.cy, box.yaw, box.hx, box.hy)
+        landing = next((o.id for o in obstacles if rects_overlap(placed, o)), None)
+        if landing:
+            return {}, f"{held.id} would land against {landing}"
+        hit = self._footprint_blocked(obstacles, dock, ryaw, rel) if shift > 0 else None
+        if hit:
+            return {}, f"backing off {shift:.2f} m to extend the arm would hit {hit}"
+        trapped = self._release_blocked(obstacles, held, (box.cx, box.cy), box.yaw, dock, ryaw)
+        if trapped:
+            return {}, trapped
+        retreat = self._retreat(obstacles + [placed], dock, back, ryaw, None, self.config.predock_backoff)
+        here = {"dock": list(dock), "predock": list(retreat)}
+        return (here | {"reach": reach}) if reach is not None else here, None
+
+    def _release_blocked(self, obstacles: list[Box2D], held: Entity, xy: tuple[float, float], yaw: float,
+                         dock: tuple[float, float], dock_yaw: float) -> str | None:
+        """Why the robot, standing at ``dock``, could not drive away after setting ``held`` down on
+        the floor at ``xy`` and heading ``yaw``, or None. A carried object may overhang the base; on
+        the floor it must lie clear of the base, and the robot must back out to room to turn."""
+        box, bottom, top = entity_box(held)
+        if top - bottom <= self.ground_clearance:
+            return None
+        placed = Box2D(held.id, xy[0], xy[1], yaw, box.hx, box.hy)
+        if self._footprint_blocked([placed], dock, dock_yaw):
+            return f"{held.id} would lie under the robot's base"
+        back = (-math.cos(dock_yaw), -math.sin(dock_yaw))
+        if self._retreat(obstacles + [placed], dock, back, dock_yaw, None, self.config.predock_backoff) is None:
+            return f"with {held.id} down there the robot could not back out to room to turn"
+        return None
 
     @staticmethod
     def _carried_box(carry: tuple, xy: tuple[float, float], yaw: float) -> Box2D:
@@ -599,7 +667,17 @@ class Esim:
                 risk = 0.4
         else:
             raise PredictionError(f"{support.id} ({support.category.value}) is neither a surface nor a receptacle")
-        approach = self._approach(es, self._anchor(es, support), spot, height, {held.id})
+        turn = None
+        if params.get("yaw") is not None:
+            want, flip = float(params["yaw"]), bool(params.get("flip"))
+
+            def turn(dock_yaw: float) -> str | None:
+                try:
+                    self._wrist_for(es, held, want, dock_yaw, flip)
+                except PredictionError as exc:
+                    return str(exc)
+                return None
+        approach = self._approach(es, self._anchor(es, support), spot, height, {held.id}, heading_issue=turn)
         fragility = (held.rigid.links[0].material.value or {}).get("fragility", 0.0) if held.rigid.links[0].material else 0.0
         risk = 1.0 - (1.0 - risk) * (1.0 - 0.05 * fragility)
         plan = {**approach, "object": held.id, "support": support.id, "spot": list(spot), "lift": height,
@@ -690,10 +768,15 @@ class Esim:
         held_box, _, _ = entity_box(held)
         here_yaw = held_box.yaw if "yaw" not in params else float(params["yaw"])
         if math.hypot(tx - held_box.cx, ty - held_box.cy) <= 0.05 and abs(_wrap(here_yaw - held_box.yaw)) <= 0.1:
-            # Put it down where it is: no motion, so no path or turning room is needed.
-            plan = {"path": [[rx, ry]], "predock": [rx, ry], "dock": [rx, ry], "yaw": ryaw, "lift": lift,
-                    "object": held.id, "floor": [held_box.cx, held_box.cy], "pathLength": 0.0}
+            here, trapped = self._put_down_here(es, held, obstacles)
+            if trapped:
+                raise PredictionError(f"cannot put {held.id} down where it is: {trapped}; set it on a surface "
+                                      "within reach with place on=<surface id>, or carry it elsewhere")
+            plan = {"path": [[rx, ry]], "yaw": ryaw, "lift": lift, "object": held.id,
+                    "floor": [held_box.cx, held_box.cy], "pathLength": 0.0, **here}
             return self._receipt(es, "place", params, 0.02, [], plan)
+        rel, reach = self._release_reach(es, held, rel)
+        lx = rel[0]
         sweep = self._sweep(rel)
         grid = build_grid(obstacles, sweep + cfg.nav_margin, [(rx, ry), (tx, ty)])
         reasons = []
@@ -703,6 +786,10 @@ class Esim:
             blocked = self._footprint_blocked(obstacles, dock, h, rel)
             if blocked:
                 reasons.append(f"heading {math.degrees(h):.0f} deg: {held.id} or the robot would hit {blocked}")
+                continue
+            trapped = self._release_blocked(obstacles, held, (tx, ty), h + dyaw, dock, h)
+            if trapped:
+                reasons.append(f"heading {math.degrees(h):.0f} deg: {trapped}")
                 continue
             predock = self._retreat(obstacles, dock, (-c, -s), h, rel, cfg.predock_backoff)
             if predock is None:
@@ -715,6 +802,8 @@ class Esim:
                 continue
             plan = {"path": [list(q) for q in path], "predock": list(predock), "dock": list(dock), "yaw": h,
                     "lift": lift, "object": held.id, "floor": [tx, ty], "pathLength": path_length(path)}
+            if reach is not None:
+                plan["reach"] = reach
             return self._receipt(es, "place", params, 0.03, [], plan)
         hint = self._boxed_in(es, obstacles, rel)
         raise PredictionError(f"cannot put {held.id} down at ({tx:.2f}, {ty:.2f}): " + "; ".join(reasons[:4])

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -22,18 +25,36 @@ EVENTS = [
 ]
 
 
+def _launcher(tmp_path, body: str) -> Path:
+    """An executable stand-in for the DSH launcher that runs the Python ``body``: a sh wrapper, or on
+    Windows a cmd wrapper as npm generates there."""
+    script = tmp_path / "fake_dsh.py"
+    script.write_text("import os, shutil, sys, time\n" + body, encoding="utf-8")
+    if os.name == "nt":
+        launcher = tmp_path / "dsh.CMD"
+        launcher.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+    else:
+        launcher = tmp_path / "dsh"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+        launcher.chmod(0o755)
+    return launcher
+
+
 def _fake_dsh(tmp_path):
     """A stand-in launcher that records argv, stdin and the patch overlay, then prints run events."""
-    script = tmp_path / "dsh"
     lines = "\n".join(json.dumps(e, ensure_ascii=False) for e in EVENTS)
-    script.write_text(
-        "#!/bin/sh\n"
-        "while [ $# -gt 0 ]; do case \"$1\" in --patch) cp \"$2\" \"$DSH_HOME/patch.yml\"; shift;; esac; "
-        "echo \"$1\" >> \"$DSH_HOME/argv\"; shift; done\necho >> \"$DSH_HOME/argv\"\n"
-        "cat > \"$DSH_HOME/stdin\"; pwd > \"$DSH_HOME/cwd\"\n"
-        f"cat <<'EOF'\n{lines}\nEOF\n", encoding="utf-8")
-    script.chmod(0o755)
-    return script
+    return _launcher(tmp_path, (
+        "home = os.environ['DSH_HOME']\n"
+        "args = sys.argv[1:]\n"
+        "if '--patch' in args:\n"
+        "    shutil.copy(args[args.index('--patch') + 1], os.path.join(home, 'patch.yml'))\n"
+        "with open(os.path.join(home, 'argv'), 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(''.join(a + '\\n' for a in args) + '\\n')\n"
+        "with open(os.path.join(home, 'stdin'), 'w', encoding='utf-8') as fh:\n"
+        "    fh.write(sys.stdin.buffer.read().decode('utf-8'))\n"
+        "with open(os.path.join(home, 'cwd'), 'w', encoding='utf-8') as fh:\n"
+        "    fh.write(os.getcwd())\n"
+        f"sys.stdout.buffer.write({lines!r}.encode('utf-8') + b'\\n')\n"))
 
 
 def _home(tmp_path, name: str, profile: str):
@@ -49,13 +70,12 @@ def _wait_idle(chat: HarnessChat, key: str, timeout: float = 10.0) -> None:
     assert not chat.agents[key].busy
 
 
-def test_a_robot_ego_api_speaking_the_wrong_alerts_shape_does_not_break_the_chat_state(tmp_path):
-    """The console polls /console/chat constantly; a malformed robot response must be absorbed.
+def test_a_robot_ego_api_answering_an_unexpected_shape_does_not_break_the_chat_state(tmp_path):
+    """The console polls /console/chat continuously; a malformed robot answer must be absorbed.
 
-    The twin's Ego API answered /ego/alerts without the "active" key, and the KeyError took the
-    whole endpoint down -- the console flashed the error text on every poll.
+    Only "active" is read from /ego/alerts, and any answer without it (an older or different
+    Ego API, a proxy error page) raised out of the poll and took the whole chat endpoint down.
     """
-    # The twin answers with a shape the reader does not expect: no "active" key.
     api = JsonServer({("GET", "/ego/alerts"): lambda q, b: {"alerts": []}}).start()
     try:
         robot = _home(tmp_path, "robot-1", "ego")
@@ -108,7 +128,8 @@ def test_robot_chat_takes_control_for_the_turn_and_gives_it_back(tmp_path):
     assert calls == ["acquire", "release"]
     patch = (robot / "patch.yml").read_text(encoding="utf-8")
     assert "steward-ego-runtime" in patch and ego.url in patch and "owner: operator" in patch
-    assert (robot / "cwd").read_text(encoding="utf-8").strip().endswith("robot-1/workspace"), "the robot runs in its empty workspace"
+    cwd = Path((robot / "cwd").read_text(encoding="utf-8"))
+    assert cwd.parts[-2:] == ("robot-1", "workspace"), "the robot runs in its empty workspace"
     stdin = (robot / "stdin").read_text(encoding="utf-8")
     assert stdin.startswith("你是家用服务机器人") and "World State" not in stdin
     assert [m["agent"] for m in chat.state()["messages"]] == ["robot"] * 3
@@ -116,9 +137,7 @@ def test_robot_chat_takes_control_for_the_turn_and_gives_it_back(tmp_path):
 
 def test_stopping_a_robot_turn_ends_the_run_and_releases_control(tmp_path):
     robot = _home(tmp_path, "robot-1", "ego")
-    script = tmp_path / "dsh"
-    script.write_text("#!/bin/sh\ncat > /dev/null\necho '{\"type\": \"session\", \"sessionId\": \"s-1\"}'\nsleep 30\n", encoding="utf-8")
-    script.chmod(0o755)
+    script = _launcher(tmp_path, "sys.stdin.read()\nprint('{\"type\": \"session\", \"sessionId\": \"s-1\"}', flush=True)\ntime.sleep(30)\n")
     calls = []
 
     def control(q, b):
@@ -144,6 +163,31 @@ def test_stopping_a_robot_turn_ends_the_run_and_releases_control(tmp_path):
     roles = [m["role"] for m in chat.state()["messages"]]
     assert "system" in roles and "error" not in roles
     assert chat.cancel("robot") == {"stopped": False}
+
+
+def test_a_turn_ended_by_the_budget_reports_a_designed_stop_not_a_failure(tmp_path):
+    """The wall-clock budget ends long turns by design: ``_terminate`` kills the harness process, and
+    on Windows that exit is non-zero with a stderr tail holding only the node startup warning, which
+    used to be reported as a run failure and alarmed the operator. A budget timeout (like an operator
+    cancel) must read as a designed end: no error entry, no failure alert."""
+    script = _launcher(tmp_path, "time.sleep(30)\n")
+    calls = []
+
+    def control(q, b):
+        calls.append(b["action"])
+        return {"owner": None}
+
+    ego = JsonServer({("POST", "/ego/control"): control, ("GET", "/ego/control"): lambda q, b: {"owner": None}}).start()
+    try:
+        chat = HarnessChat(ChatConfig(dsh=script, cwd=tmp_path, env_file=tmp_path / ".env", robot_home=_home(tmp_path, "robot-1", "ego"),
+                                      ego_api=ego.url, timeout_s=0.4), lambda: "unused")
+        chat.send("robot", "慢慢来")
+        _wait_idle(chat, "robot")
+    finally:
+        ego.stop()
+    roles = [m["role"] for m in chat.state()["messages"]]
+    assert "error" not in roles
+    assert any("回合预算" in m["text"] for m in chat.state()["messages"])
 
 
 def test_shuttle_pauses_while_an_operator_controls_the_robot():

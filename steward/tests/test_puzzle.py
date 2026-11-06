@@ -94,6 +94,15 @@ def test_the_goal_counts_neighbours_in_place_wherever_and_however_turned_the_pic
     sim.step_seconds(0.3)
     report = evaluate(scenario["goal"], sim._entity_pose)
     assert report["largestGroup"] == 8 and report["satisfied"] == 10 and not report["complete"]
+    # each constraint carries its own error, so a caller sees which seam is off by how much
+    by_pair = {(e["a"], e["b"]): e for e in report["errors"]}
+    assert len(report["errors"]) == len(scenario["goal"]["constraints"])
+    assert all(e["satisfied"] for pair, e in by_pair.items() if "w:piece-22" not in pair)
+    assert all(0.0 <= e["positionErrM"] <= 0.03 and e["yawErrDeg"] <= 15.0
+               for e in by_pair.values() if e["satisfied"])
+    missing = [e for pair, e in by_pair.items() if "w:piece-22" in pair]
+    assert len(missing) == 2 and not any(e["satisfied"] for e in missing)
+    assert all(e["positionErrM"] > 0.03 for e in missing)
 
 
 def test_a_pourable_box_is_grasped_with_its_contents_only_without_its_lid_and_carries_them(kitchen_root):
@@ -183,7 +192,7 @@ def test_a_face_the_camera_cannot_see_is_explained_from_the_camera_geometry():
     est = EgoEstimator(robot_model=steward_bot().to_dict())
     est.odometry = {"x": 0.0, "y": 0.0, "yaw": 0.0, "sigma": {"pos": 0.003, "yaw": 0.003}}
     cam = est.camera_pose()
-    intrinsics = est._camera["intrinsics"]
+    intrinsics = est.camera_intrinsics()
     lowest = math.radians(30.0 + intrinsics["fovy"] / 2)  # the head camera looks 30° down
 
     def hint(dx, dy):
@@ -504,6 +513,59 @@ def test_a_pour_spot_keeps_the_contents_slide_from_every_edge_of_the_surface():
     assert esim._edge_distance(entity_box(table)[0], spot) >= keep - 1e-9
     with pytest.raises(PredictionError, match="of the edge"):
         esim._choose_spot(es, table, entity_box(table)[0], box, entity_box(box)[0], [0.0, -0.3], 0.0, 0.015, edge_keep=keep)
+
+
+def test_a_held_box_overhanging_the_base_is_not_put_down_on_the_floor_under_it():
+    from steward.ego.esim import Esim
+
+    model = steward_bot().to_dict()
+    est = EgoEstimator(robot_model=model)
+    est.tracks = {"e:2": _track("e:2", "box", [0.35, 0.0, 0.775], [0.54, 0.54, 0.05]),
+                  "e:3": _track("e:3", "puzzle_piece", [0.35, 0.0, 0.003], [0.115, 0.115, 0.006])}
+    es = est.to_scene()
+    box, piece = es.find("e:2"), es.find("e:3")
+    esim = Esim(model)
+    assert "under the robot's base" in esim._release_blocked([], box, (0.35, 0.0), 0.0, (0.0, 0.0), 0.0)
+    assert esim._release_blocked([], box, (0.75, 0.0), 0.0, (0.0, 0.0), 0.0) is None
+    assert esim._release_blocked([], piece, (0.0, 0.0), 0.0, (0.0, 0.0), 0.0) is None, "the base drives over it"
+
+
+def test_a_held_box_overhanging_the_base_is_set_down_on_the_floor_with_the_arm_extended():
+    from steward.ego.esim import Esim
+
+    model = steward_bot().to_dict()
+    est = EgoEstimator(robot_model=model)
+    est.odometry = {"x": 0.0, "y": 0.0, "yaw": 0.0, "sigma": {"pos": 0.0, "yaw": 0.0}}
+    est.joints = {"lift": 0.8, "reach": 0.1}
+    est.tracks = {"e:2": _track("e:2", "box", [0.35, 0.0, 0.775], [0.54, 0.54, 0.05])}
+    est.held_id, est.tracks["e:2"].held = "e:2", True
+    esim = Esim(model)
+    receipt = esim.predict(est.to_scene(), "place", {"at": [0.35, 0.0]})
+    assert receipt["feasible"], receipt["issues"]
+    plan = receipt["plan"]
+    shift = plan["reach"] - 0.1
+    assert shift > 0 and plan["dock"] == pytest.approx([-shift, 0.0]), "it backs off as far as the arm extends"
+    assert plan["predock"][0] < plan["dock"][0], "then backs away from the box it set down"
+    far = esim.predict(est.to_scene(), "place", {"at": [2.0, 0.0], "yaw": 0.0})
+    assert far["feasible"], far["issues"]
+    assert far["plan"]["reach"] == pytest.approx(plan["reach"])
+    assert far["plan"]["dock"][0] == pytest.approx(2.0 - (0.35 + shift), abs=1e-6)
+
+
+def test_a_heading_the_wrist_cannot_turn_to_from_the_nearest_side_is_placed_from_another_side():
+    from steward.ego.esim import Esim
+
+    model = steward_bot().to_dict()
+    est = EgoEstimator(robot_model=model)
+    est.odometry = {"x": 0.0, "y": 1.0, "yaw": -math.pi / 2, "sigma": {"pos": 0.0, "yaw": 0.0}}
+    est.joints = {"lift": 0.85, "reach": 0.1, "wrist_yaw": 0.0}
+    est.tracks = {"e:4": _track("e:4", "table", [0.0, 0.0, 0.375], [0.6, 0.6, 0.75]),
+                  "e:3": _track("e:3", "puzzle_piece", [0.0, 0.6, 0.85], [0.115, 0.115, 0.006], yaw=-math.pi / 2)}
+    est.held_id, est.tracks["e:3"].held = "e:3", True
+    receipt = Esim(model).predict(est.to_scene(), "place", {"on": "e:4", "offset": [0.0, 0.1], "yaw": math.pi / 2})
+    assert receipt["feasible"], receipt["issues"]
+    assert abs(math.cos(receipt["plan"]["yaw"])) == pytest.approx(1.0, abs=1e-6), "docked at a side face, not the near one"
+    assert abs(receipt["plan"]["wristYaw"]) == pytest.approx(math.pi / 2, abs=1e-6)
 
 
 def test_a_remembered_face_gathers_views_and_is_replaced_after_the_object_is_put_down():

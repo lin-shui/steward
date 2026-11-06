@@ -24,7 +24,7 @@ def rig():
     skills = CobotSkills(command=lambda cmd: sim.command("w:cobot", cmd),
                          state=lambda: sim.sensors("w:cobot"), config=MotionConfig(tick_s=0.01))
     est = EgoEstimator(robot_model=cobot_magic().to_dict())
-    frame = lambda: decode_rgbd(sim.rgbd("w:cobot", camera="top_camera"))  # noqa: E731
+    frame = lambda: decode_rgbd(sim.rgbd("w:cobot", "top_camera"))  # noqa: E731
     try:
         yield sim, est, skills, frame
     finally:
@@ -39,7 +39,8 @@ def _truth(sim: WorldSim, entity_id: str) -> list[float]:
 def test_rgbd_frames_carry_no_labels(rig) -> None:
     sim, _, _, frame = rig
     payload = frame()
-    assert set(payload) == {"rgb", "depth", "mask", "fovy", "header"}
+    assert set(payload) == {"camera", "rgb", "depth", "mask", "fovy", "header"}
+    assert payload["camera"] == "top_camera", "a sensor id, not a label"
     assert "detections" not in payload["header"]
     assert payload["mask"].dtype == np.uint8
     assert payload["depth"].dtype == np.float32
