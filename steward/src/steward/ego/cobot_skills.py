@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from steward.assets.cobot import HOME, LIFT_RANGE, TCP_OFFSET
+from steward.assets.cobot import LIFT_RANGE, TCP_OFFSET, park
 from steward.ego.ik import CobotIK, IkError
 from steward.math3d import pose_compose, quat_from_axis_angle, wrap_angle
 
@@ -437,13 +437,13 @@ class CobotSkills:
         self.move_to(job, arm, at, orientation or _tool_down(), line=bool(plan.get("line", False)))
 
     def park(self, job: Job, plan: dict) -> None:
-        """Return one arm to the twin's rest posture, out of the overhead camera's view.
+        """Return one arm to the twin's rest posture, out of the head cameras' view.
 
         A mission that gives up while holding something over the table leaves its own forearm in
         the camera; parking is a verb because "look again" needs a clear view first."""
         arm = self._arm(plan)
         self.move_joints(job, {"arm": arm,
-                               "joints": dict(zip(self.ik.joint_names(arm), HOME, strict=True))})
+                               "joints": dict(zip(self.ik.joint_names(arm), park(arm), strict=True))})
 
     def move_joints(self, job: Job, plan: dict) -> None:
         """Drive one arm's six joints to the requested posture."""

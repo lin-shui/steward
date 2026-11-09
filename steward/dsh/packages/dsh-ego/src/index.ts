@@ -49,6 +49,16 @@ export interface InspectResult {
   sizeM: number[]
   /** Share of cells seen (not out of view or hidden). */
   coverage: number
+  /** Colour standard deviation of seen cells. Lighting inflates this on a plain back; prefer `plain` / `interiorColors`. */
+  spread?: number
+  /** Colour standard deviation excluding a one-cell border (neighbours often tint the edge). */
+  interiorSpread?: number
+  /** Share of interior cells seen. */
+  interiorCoverage?: number
+  /** Distinct interior colours after 16-level quantisation; a plain cardboard back stays near 1–4, a print has dozens. */
+  interiorColors?: number
+  /** True when `interiorColors` is low enough that the face is treated as a uniform back. */
+  plain?: boolean
   /** Present when part of the face is unseen: why, from each camera's view (too close below it, beside or behind it, too far, hidden). */
   hint?: string
   /** Row 0 is the object's +y edge, column 0 its -x edge; each cell is [r, g, b] (0-255) or null. */
@@ -81,6 +91,8 @@ export interface FaceMatchEntry {
   cellM?: number
   /** Colour standard deviation of the object's face; near 0 the face is plain. */
   spread?: number
+  /** Colour standard deviation excluding a one-cell border; near 0 means a plain back. */
+  interiorSpread?: number
   /** Share of the object's face the robot has seen. */
   faceCoverage?: number
   /** World seconds since the robot last saw the object's face. */
@@ -105,6 +117,13 @@ export interface Annotation {
   label?: string
   /** Affordances replacing the category prior, for example `graspable`, `pourable`, `support-surface`. */
   affordances?: string[]
+}
+
+/** The robot agent's judgement that an Ego-State object is a false perception. */
+export interface Forgetting {
+  entity: string
+  /** What made the object implausible and how its place was looked at again without perceiving it. */
+  reason: string
 }
 
 /** What the instruction asked for, to find the objects that could be it (see {@link EgoService.candidates}). */
@@ -203,6 +222,10 @@ export interface PredictionReceipt {
   issues: string[]
   /** Robot clock time after which the receipt is rejected. */
   expiresAt: number
+  /** Robot clock when the receipt was read; used with `expiresAt` / `expired`. */
+  now?: number
+  /** True when the robot clock has passed `expiresAt`. */
+  expired?: boolean
   plan: JsonObject
   /** Entities that made an infeasible prediction fail; movable ones come with parking spots. */
   blockers?: ReceiptBlocker[]
@@ -297,7 +320,7 @@ export abstract class EgoService extends Service {
   /**
    * Look closely at an object's top face (one fresh frame of each camera).
    * @param entity - Ego-State object id.
-   * @param px - grid size, 4 to 64.
+   * @param px - grid size, 4 to 128.
    * @param signal - caller cancellation.
    * @returns the sampled face colours in the object's own frame.
    */
@@ -308,7 +331,7 @@ export abstract class EgoService extends Service {
    * scale, from the faces the robot remembers (refreshed first for those in view).
    * @param entities - Ego-State ids of the objects whose faces are sought.
    * @param reference - Ego-State id of the object showing the whole picture.
-   * @param px - cells across each object's shorter side, 4 to 16.
+   * @param px - cells across each object's shorter side, 4 to 32.
    * @param signal - caller cancellation.
    * @returns the best placements of each face on the reference.
    */
@@ -322,6 +345,15 @@ export abstract class EgoService extends Service {
    * @returns the object's Ego-State summary entry after the change.
    */
   abstract annotate(annotation: Annotation, signal?: AbortSignal): Promise<JsonObject>
+
+  /**
+   * Remove an object the robot agent judged a false perception. The robot refuses while the object
+   * is held or was perceived within its `forget_unseen_s` (3 s by default).
+   * @param forgetting - object id and the reason.
+   * @param signal - caller cancellation.
+   * @returns the removal record as listed in the Ego-State summary's `dropped`.
+   */
+  abstract forget(forgetting: Forgetting, signal?: AbortSignal): Promise<JsonObject>
 
   /**
    * Objects that could be what a name and approximate size refer to, best first, each with its

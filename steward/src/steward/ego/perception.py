@@ -388,6 +388,62 @@ def face_rows(face: np.ndarray) -> list[list[list[int] | None]]:
     return [[None if not np.isfinite(c[0]) else [int(round(float(v))) for v in c] for c in row] for row in face]
 
 
+# Distinct RGB buckets (each channel floored to this step) below which an interior is treated as
+# plain. Lighting makes a cardboard back's RGB std look high (~25-35); the bucket count stays near 1.
+FACE_PLAIN_COLORS = 20
+FACE_COLOR_STEP = 16
+
+
+def face_colour_stats(rows: list[list], margin: int = 1) -> dict:
+    """Colour statistics of seen cells on a face grid: the whole face and its interior.
+
+    Edge cells often mix in a neighbour's colour when flat objects lie packed. Lighting gradients
+    also inflate RGB standard deviation on a plain cardboard back, so ``interiorSpread`` alone
+    cannot tell face-down from face-up. ``interiorColors`` counts distinct interior colours after
+    quantising each channel by :data:`FACE_COLOR_STEP`; a plain back stays near 1–4 while a printed
+    face has dozens. ``plain`` is true when that count is at most :data:`FACE_PLAIN_COLORS`. When
+    the grid is too small for a ``margin``-cell border, the interior is the whole face.
+
+    :param rows: square grid as :func:`top_face` returns it.
+    :param margin: cells dropped from each edge for the interior.
+    :returns: ``spread``, ``interiorSpread``, ``interiorCoverage``, ``interiorColors``, ``plain``."""
+    if not rows or not rows[0]:
+        return {"spread": 0.0, "interiorSpread": 0.0, "interiorCoverage": 0.0,
+                "interiorColors": 0, "plain": True}
+    h, w = len(rows), len(rows[0])
+    use_margin = margin if min(h, w) > 2 * margin else 0
+
+    def values(interior: bool) -> list[list[int]]:
+        out = []
+        for i, row in enumerate(rows):
+            for j, cell in enumerate(row):
+                if cell is None:
+                    continue
+                if interior and (i < use_margin or j < use_margin or i >= h - use_margin or j >= w - use_margin):
+                    continue
+                out.append(cell)
+        return out
+
+    def spread(vals: list[list[int]]) -> float:
+        if not vals:
+            return 0.0
+        return round(float(np.asarray(vals, float).std()), 1)
+
+    def colors(vals: list[list[int]]) -> int:
+        step = FACE_COLOR_STEP
+        return len({(c[0] // step, c[1] // step, c[2] // step) for c in vals})
+
+    all_seen, interior = values(False), values(True)
+    if use_margin:
+        interior_cells = max(1, (h - 2 * use_margin) * (w - 2 * use_margin))
+    else:
+        interior_cells = max(1, h * w)
+    interior_colors = colors(interior)
+    return {"spread": spread(all_seen), "interiorSpread": spread(interior),
+            "interiorCoverage": round(len(interior) / interior_cells, 3),
+            "interiorColors": interior_colors, "plain": interior_colors <= FACE_PLAIN_COLORS}
+
+
 def top_face(frame: dict, cam_pose: dict, centre: np.ndarray, size: np.ndarray, yaw: float, top: float,
              px: int, depth_tol: float = 0.025, py: int | None = None) -> list[list[list[int] | None]]:
     """:func:`top_face_array` as JSON rows (``None`` where unseen)."""

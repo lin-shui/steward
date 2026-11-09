@@ -11,17 +11,24 @@ fingers — so a left-arm goal never drags the right arm along. Joint limits com
 Frames: the end-effector frame of an arm is its last revolute link (``L_link6`` / ``R_link6``).
 Its +z axis points out through the pinch point, 0.135 m away (``assets.cobot.TCP_OFFSET``), and
 the fingers separate along its y axis; the result is measured, not assumed — see
-``tests/test_cobot.py::test_tcp_is_where_the_fingers_pinch``.
+``tests/test_cobot.py::test_tcp_is_where_the_fingers_pinch``. The solver's model carries a site
+there (``L_pinch`` / ``R_pinch``) for :meth:`CobotIK.solve_body`.
+
+:meth:`CobotIK.solve_body` solves the whole body above the chassis at once -- the torso lift and
+the six arm joints -- for the pinch point and the tool orientation, with any tool axis left free
+(a tool tilt the task does not fix): the redundant joints settle where they stay nearest the
+posture they start from, so successive goals of one motion keep one posture.
 """
 
 from __future__ import annotations
 
 import math
 
+import mujoco
 import numpy as np
 
 from steward.assets.cobot import HOME, TCP_OFFSET, cobot_magic
-from steward.math3d import quat_angle_between
+from steward.math3d import matrix_from_quat, quat_angle_between
 from steward.scene.mjcf import build_mjcf
 from steward.scene.schema import SceneState
 
@@ -45,13 +52,15 @@ class IkError(RuntimeError):
 class CobotIK:
     """FK/IK for one Cobot Magic twin, on the robot's own (URDF-derived) model."""
 
-    def __init__(self, robot: dict | None = None, timestep: float = 0.002) -> None:
+    def __init__(self, robot: dict | None = None, timestep: float = 0.002, self_clearance: float = 0.01) -> None:
+        """``self_clearance``: the least distance :meth:`solve_body` keeps between an arm's links
+        (beyond its shoulder) and the robot's frame and chassis."""
         self.robot = robot if robot is not None else cobot_magic().to_dict()
         # Only the robot is compiled: IK must not depend on scene furniture.
         ent = dict(self.robot)
         ent["id"] = _ENT
         build = build_mjcf(SceneState(mode="world", entities=[_as_entity(ent)]), timestep=timestep)
-        self.model = build.compile()
+        self.model = mujoco.MjModel.from_xml_string(_with_pinch_sites(build.xml), build.assets or None)
         self.data = mink.Configuration(self.model)
         # MuJoCo's qpos0 is the zero posture, not the robot's posture: the lift's legal range does
         # not even contain zero, so a solver seeded from qpos0 stands outside its own limits and
@@ -79,20 +88,44 @@ class CobotIK:
                 "qadr": qadrs,
                 "dofadr": dofadrs,
                 "ee": f"{_ENT}/{arm}_link6",
+                "pinch": f"{_ENT}/{arm}_pinch",
                 "limits": [(float(self.model.jnt_range[_joint_id(self.model, n)][0]),
                             float(self.model.jnt_range[_joint_id(self.model, n)][1])) for n in names],
+                "geoms": [g for g in range(self.model.ngeom) if mujoco.mj_id2name(
+                    self.model, mujoco.mjtObj.mjOBJ_BODY, int(self.model.geom_bodyid[g])) in
+                    {f"{_ENT}/{arm}_link{k}" for k in range(1, _DOF_PER_ARM + 1)}],
             }
         # Every DOF that is not part of a solved arm is frozen: the base's x, y and yaw, the lift,
         # the other arm and both fingers. Freezing the base matters as much as freeing the arm --
         # an IK that may drive the chassis can "reach" any table by walking the robot there.
         all_dofs = [int(self.model.jnt_dofadr[j]) for j in range(self.model.njnt)]
-        self._freeze = {}
+        lift = _joint_id(self.model, f"{_ENT}::lift")
+        self._lift_qadr, self._lift_dof = int(self.model.jnt_qposadr[lift]), int(self.model.jnt_dofadr[lift])
+        self._freeze, self._freeze_body = {}, {}
         for arm in ARMS:
             owned = set(self._arms[arm]["dofadr"])
             self._freeze[arm] = mink.DofFreezingTask(
                 self.model, dof_indices=[d for d in all_dofs if d not in owned])
+            # The torso joins the arm in a whole-body solve; the chassis and the other arm stay put.
+            self._freeze_body[arm] = mink.DofFreezingTask(
+                self.model, dof_indices=[d for d in all_dofs if d not in owned | {self._lift_dof}])
         self._posture = mink.PostureTask(self.model, cost=1e-2)
         self._limit = mink.ConfigurationLimit(self.model)
+        # The torso sinks as the arm tips a held box past upright, swinging the upper arm into the
+        # frame (measured: the twin's L_link2 stopped against it, the tip fell 3 cm short and the
+        # box came down on the table): a whole-body solve keeps the arm clear of its own body.
+        body = self._collidable({f"{_ENT}/frame", f"{_ENT}/base"})
+        for arm in ARMS:
+            links = self._collidable({f"{_ENT}/{arm}_link{k}" for k in range(2, _DOF_PER_ARM)})
+            self._arms[arm]["avoid"] = mink.CollisionAvoidanceLimit(
+                self.model, [(links, body)], minimum_distance_from_collisions=self_clearance,
+                collision_detection_distance=self_clearance + 0.05)
+
+    def _collidable(self, bodies: set[str]) -> list[int]:
+        """Ids of the geoms of ``bodies`` that take part in contacts."""
+        m = self.model
+        return [g for g in range(m.ngeom) if (m.geom_contype[g] or m.geom_conaffinity[g])
+                and mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, int(m.geom_bodyid[g])) in bodies]
 
     # ------------------------------------------------------------------ queries
     def joint_names(self, arm: str) -> list[str]:
@@ -162,6 +195,41 @@ class CobotIK:
         rot = np.asarray(pose.rotation().as_matrix())
         return {"p": [float(v) for v in p], "q": _quat_from_matrix(rot)}
 
+    def lowest(self, arm: str, joints: list[float], beyond_x: float = -math.inf) -> float:
+        """Height in the world frame of the lowest point of the arm's links (joint 1 to the flange
+        with the gripper housing) at ``joints``; only links reaching past world ``x`` = ``beyond_x``
+        count (inf when none does). Spheres and capsules by the part of their axis past it, other
+        geometry by its bounding box."""
+        spec = self._arms[self._check(arm)]
+        q = np.array(self.data.q, dtype=float)
+        for qadr, value in zip(spec["qadr"], joints, strict=True):
+            q[qadr] = value
+        self.data.update(q)
+        d, m = self.data.data, self.model
+        low = math.inf
+        for g in spec["geoms"]:
+            rot, pos = d.geom_xmat[g].reshape(3, 3), d.geom_xpos[g]
+            kind, size = int(m.geom_type[g]), m.geom_size[g]
+            if kind in (mujoco.mjtGeom.mjGEOM_SPHERE, mujoco.mjtGeom.mjGEOM_CAPSULE):
+                # The axis (a point for a sphere) where it lies past beyond_x less the radius,
+                # lowered by the radius.
+                axis = rot[:, 2] * (size[1] if kind == mujoco.mjtGeom.mjGEOM_CAPSULE else 0.0)
+                ends = [pos - axis, pos + axis]
+                cut = beyond_x - size[0]
+                inside = [e for e in ends if e[0] > cut]
+                if not inside:
+                    continue
+                if len(inside) == 1 and ends[0][0] != ends[1][0]:
+                    t = (cut - ends[0][0]) / (ends[1][0] - ends[0][0])
+                    inside.append(ends[0] + (ends[1] - ends[0]) * t)
+                low = min(low, min(float(e[2]) for e in inside) - float(size[0]))
+            else:
+                centre = pos + rot @ m.geom_aabb[g][:3]
+                half = np.abs(rot) @ m.geom_aabb[g][3:]
+                if centre[0] + half[0] > beyond_x:
+                    low = min(low, float(centre[2] - half[2]))
+        return low
+
     # --------------------------------------------------------------------- ik
     def solve(self, arm: str, position: list[float], orientation: list[float] | None = None,
               q_init: list[float] | None = None, iterations: int = 120,
@@ -209,6 +277,91 @@ class CobotIK:
             f"{arm} arm IK missed {list(position)}: {best_err * 1000:.1f} mm after {iterations} steps"
             + ("" if best is None else f" (best q={[round(v, 3) for v in best]}, rotation {oerr:.3f} rad)")
         )
+
+    def solve_body(self, arm: str, pinch: list[float], tool: list[float], q_init: list[float],
+                   lift_init: float, lift_prefer: float, free_axes: tuple[float, float, float] = (1.0, 1.0, 1.0),
+                   iterations: int = 300, tolerance: float = 4e-3, orientation_tolerance: float = 0.02,
+                   lift_cost: float = 0.01, posture_cost: float = 1e-2, gain: float = 1.0,
+                   damping: float = 1e-2, stall: int = 80, settle: int = 80,
+                   settled: float = 1e-4) -> tuple[float, list[float]]:
+        """Torso height and arm joints putting ``arm``'s pinch point at ``pinch`` (world) with the
+        tool at ``tool`` (wxyz quaternion), starting from ``q_init`` and ``lift_init``.
+
+        ``free_axes`` weighs the tool orientation about the tool's own x, y and z axes: 1 holds an
+        axis, a small weight leaves it to the solver, which turns the tool about that axis only as
+        far as the pinch point needs. The arm joints are drawn to ``q_init`` (``posture_cost``) and
+        the torso to ``lift_prefer`` (``lift_cost``). Only the held axes count toward
+        ``orientation_tolerance``. A solve whose pinch point has come no 0.2 mm closer in
+        ``stall`` steps gives up. Once the goal is met the redundant joints keep settling, within the
+        tolerances, for up to ``settle`` steps or until no joint moves ``settled`` rad in a step: a
+        posture the goal does not pin down settles where the costs put it, not where convergence
+        happened to stop, so neighbouring goals solve to neighbouring postures. The arm's links stay
+        ``self_clearance`` clear of the robot's frame and chassis.
+
+        Returns:
+            ``(lift, joints)``.
+
+        Raises:
+            IkError: The pinch point or a held axis is not met within the tolerances.
+        """
+        arm = self._check(arm)
+        spec = self._arms[arm]
+        _check_len(q_init, _DOF_PER_ARM, f"{arm} arm seed")
+        q = np.array(self.data.q, dtype=float)
+        for qadr, value in zip(spec["qadr"], self._within_limits(arm, q_init), strict=True):
+            q[qadr] = value
+        lo, hi = self.model.jnt_range[_joint_id(self.model, f"{_ENT}::lift")]
+        q[self._lift_qadr] = min(max(float(lift_init), lo), hi)
+        self.data.update(q)
+        held = np.asarray(free_axes, dtype=float)
+        place = mink.FrameTask(spec["pinch"], "site", position_cost=1.0, orientation_cost=0.0, gain=gain, lm_damping=damping)
+        turn = mink.FrameTask(spec["pinch"], "site", position_cost=0.0, orientation_cost=held, gain=gain, lm_damping=damping)
+        cost = np.full(self.model.nv, posture_cost)
+        cost[self._lift_dof] = lift_cost
+        posture = mink.PostureTask(self.model, cost=cost)
+        target_q = np.array(self.data.q, dtype=float)
+        target_q[self._lift_qadr] = min(max(float(lift_prefer), lo), hi)
+        posture.set_target(target_q)
+        goal = np.asarray(matrix_from_quat(list(tool)), dtype=float).reshape(3, 3)
+        best, best_err, since = None, float("inf"), 0
+        met: tuple[float, list[float]] | None = None
+        steps = 0
+        for _ in range(iterations + settle):
+            now = self.data.get_transform_frame_to_world(spec["pinch"], "site")
+            rot, pos = np.asarray(now.rotation().as_matrix()), np.asarray(now.translation())
+            place.set_target(_se3_matrix(rot, pinch))
+            turn.set_target(_se3_matrix(goal, pos))
+            err = float(np.linalg.norm(pos - np.asarray(pinch, dtype=float)))
+            oerr = float(np.max(np.abs(_rotation_vector(rot.T @ goal) * (held >= 0.5))))
+            if err <= tolerance and oerr <= orientation_tolerance:
+                met = (float(self.data.q[self._lift_qadr]), self.current(arm))
+                steps += 1
+                if steps > settle:
+                    return met
+            elif met is not None:
+                return met  # settling would leave the goal: the last posture that met it
+            elif steps == 0 and _ >= iterations:
+                break
+            if err < best_err - 2e-4:
+                best, best_err, since = self.current(arm), err, 0
+            else:
+                since += 1
+                if since > stall:
+                    break
+            try:
+                velocity = mink.solve_ik(self.data, [place, turn, posture], self.dt, solver="daqp",
+                                         limits=[self._limit, spec["avoid"]], constraints=[self._freeze_body[arm]])
+            except mink.NoSolutionFound as exc:
+                if met is not None:
+                    return met
+                raise IkError(f"{arm} arm whole-body IK found no solution toward {list(pinch)}") from exc
+            self.data.integrate_inplace(velocity, self.dt)
+            if met is not None and float(np.max(np.abs(velocity))) * self.dt < settled:
+                return met
+        if met is not None:
+            return met
+        raise IkError(f"{arm} arm whole-body IK missed {[round(v, 3) for v in pinch]}: {best_err * 1000:.1f} mm "
+                      f"after {iterations} steps" + ("" if best is None else f" (best q={[round(v, 3) for v in best]})"))
 
     def reachable(self, arm: str, position: list[float], orientation: list[float] | None = None,
                   q_init: list[float] | None = None) -> bool:
@@ -305,6 +458,40 @@ def _as_entity(d: dict):
 def _check_len(values, n: int, what: str) -> None:
     if len(values) != n:
         raise ValueError(f"{what} must have {n} values, got {len(values)}")
+
+
+def _with_pinch_sites(xml: str) -> str:
+    """The compiled robot's MJCF with a site at each arm's pinch point, ``TCP_OFFSET`` out of link6."""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(xml)
+    for arm in ARMS:
+        body = next((b for b in root.iter("body") if b.get("name") == f"{_ENT}/{arm}_link6"), None)
+        if body is None:
+            raise KeyError(f"the robot model has no body {_ENT}/{arm}_link6")
+        ET.SubElement(body, "site", name=f"{_ENT}/{arm}_pinch", pos=" ".join(str(v) for v in TCP_OFFSET), size="0.005")
+    return ET.tostring(root, encoding="unicode")
+
+
+def _se3_matrix(rot: np.ndarray, position) -> "mink.SE3":
+    m = np.eye(4)
+    m[:3, :3] = rot
+    m[:3, 3] = np.asarray(position, dtype=float)
+    return mink.SE3.from_matrix(m)
+
+
+def _rotation_vector(m: np.ndarray) -> np.ndarray:
+    """Axis times angle of rotation matrix ``m``."""
+    angle = math.acos(min(1.0, max(-1.0, (float(np.trace(m)) - 1.0) / 2.0)))
+    if angle < 1e-9:
+        return np.zeros(3)
+    axis = np.array([m[2, 1] - m[1, 2], m[0, 2] - m[2, 0], m[1, 0] - m[0, 1]])
+    norm = float(np.linalg.norm(axis))
+    if norm < 1e-9:  # a half turn: the axis is the column of m + I with the largest norm
+        cols = m + np.eye(3)
+        axis = cols[:, int(np.argmax(np.linalg.norm(cols, axis=0)))]
+        norm = float(np.linalg.norm(axis))
+    return axis / norm * angle
 
 
 def _se3(position: list[float], orientation: list[float]) -> "mink.SE3":

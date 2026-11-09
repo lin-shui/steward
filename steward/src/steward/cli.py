@@ -27,6 +27,7 @@ from pathlib import Path
 
 from steward.embodiments import EMBODIMENTS
 from steward.phases import LATEST_PHASE, PHASES, load_misnames
+from steward.world.chat import TURN_BUDGET_S
 
 STEWARD_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_ROOT = STEWARD_DIR / "var" / "steward"
@@ -41,12 +42,6 @@ COBOT_ROBOT_PORT = 7440
 # The twin's scripted missions (steward.ego.cobot_runtime.MISSIONS), named here so parsing the
 # command line does not import the skill layer and its IK solver.
 COBOT_MISSIONS = ("bowl-on-plate", "nest-bowls", "carry-to-counter")
-
-
-def _robot_model() -> dict:
-    from steward.assets.generators import steward_bot
-
-    return steward_bot().to_dict()
 
 
 def _tableware(ent) -> bool:
@@ -91,7 +86,8 @@ def _host(args, run_dir: Path, start: bool = True):
                        wca_port=args.wca_port, robot_ports=ports, chat=_chat_config(args),
                        phase=args.phase, fallback_phase=LATEST_PHASE, bind_wait_s=getattr(args, "bind_wait", 0.0),
                        pause_on_perception_fault=getattr(args, "pause_on_perception_fault", False),
-                       freeze_idle=args.freeze_idle,
+                       freeze_idle=args.freeze_idle, body=getattr(args, "body", None),
+                       dispatch_task=getattr(args, "dispatch_task", False),
                        misnames=load_misnames(args.misnames_config) if getattr(args, "misnames_config", "") else None)
     return host.start() if start else host
 
@@ -138,7 +134,8 @@ def _chat_config(args):
     _dsh = _dsh_bin / ("dsh.CMD" if os.name == "nt" and (_dsh_bin / "dsh.CMD").exists() else "dsh")
     return ChatConfig(dsh=_dsh, cwd=STEWARD_DIR,
                       env_file=STEWARD_DIR / ".env", world_home=Path(world) if world else None,
-                      robot_home=Path(robot) if robot else None, ego_api=getattr(args, "ego_api", None))
+                      robot_home=Path(robot) if robot else None, ego_api=getattr(args, "ego_api", None),
+                      timeout_s=getattr(args, "turn_budget_s", TURN_BUDGET_S))
 
 
 def cmd_world(args) -> int:
@@ -166,11 +163,15 @@ def _segmenter(config: str, root: str):
     return Segmenter.from_files(Path(config), cache_dir=Path(root) / "ego" / "segmentation")
 
 
-def _start_ego(robot_url: str, api_port: int, out_dir: Path, bind_wait_s: float = 0.0, segmenter=None):
+def _start_ego(robot_url: str, api_port: int, out_dir: Path, bind_wait_s: float = 0.0, segmenter=None,
+               body: str = "steward-bot"):
+    from steward.ego.bodies import body_arm, robot_model, runtime_config
     from steward.ego.runtime import EgoRuntime, RobotLink
     from steward.ego.server import ego_api
 
-    runtime = EgoRuntime(RobotLink(robot_url), _robot_model(), out_dir=out_dir, segmenter=segmenter)
+    model = robot_model(body)
+    runtime = EgoRuntime(RobotLink(robot_url), model, runtime_config(body), out_dir=out_dir, segmenter=segmenter,
+                         arm=body_arm(body, model))
     runtime.start()
     api = ego_api(runtime, port=api_port, bind_wait_s=bind_wait_s).start()
     return runtime, api
@@ -179,7 +180,7 @@ def _start_ego(robot_url: str, api_port: int, out_dir: Path, bind_wait_s: float 
 def cmd_ego(args) -> int:
     out_dir = Path(args.out_dir) if args.out_dir else Path(args.root) / "ego" / "observations"
     runtime, api = _start_ego(args.robot_url, args.api_port, out_dir, args.bind_wait,
-                              _segmenter(args.segmentation_config, args.root))
+                              _segmenter(args.segmentation_config, args.root), body=args.body)
     print(json.dumps({"egoApi": api.url, "robot": args.robot_url}), flush=True)
     if args.parent_pid:
         _exit_with_parent(args.parent_pid)
@@ -258,8 +259,8 @@ class _EgoProcess:
             cmd += ["--task", task]
         if self.mission_config:
             cmd += ["--mission-config", json.dumps(self.mission_config, ensure_ascii=False)]
-        if body["ego"] == "ego":  # only the mobile robot's runtime segments by itself
-            cmd += ["--segmentation-config", args.segmentation_config]
+        if body["ego"] == "ego":  # the shared runtime segments by itself and drives the named body
+            cmd += ["--segmentation-config", args.segmentation_config, "--body", embodiment]
         # The child writes its piped stdout in the locale encoding (GBK on Chinese Windows) unless told
         # otherwise; the reader decodes UTF-8, so a locale decode error cannot kill it and backpressure the child.
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, encoding="utf-8",
@@ -306,7 +307,8 @@ class EgoSupervisor:
     runtime still polling when its world is replaced would see the clock go back and start a
     round against a scenario it is not built for. :meth:`reconcile` runs afterwards and starts
     the runtimes the new bodies need. Same robot, same body: the process is kept and reboots
-    itself on the clock change, so the console's 重置 does not cost a process.
+    itself on the new episode. The console's 重置 replaces every process (:meth:`retire`, then
+    :meth:`reconcile`), so nothing the robot believed, planned or recorded is left over.
 
     The first robot keeps the fixed Ego API port (the console chat and `steward chores --api`
     find it there); any further robot takes a free port. A robot whose body is not in the
@@ -351,6 +353,14 @@ class EgoSupervisor:
         with self._lock:
             for rid in self._departing(self._wanted(scenario), self.procs):
                 self.procs.pop(rid).stop()
+                host.detach_ego_api(rid)
+
+    def retire(self, host) -> None:
+        """Stop every runtime; :meth:`reconcile` starts them anew."""
+        with self._lock:
+            procs, self.procs = self.procs, {}
+            for rid, proc in procs.items():
+                proc.stop()
                 host.detach_ego_api(rid)
 
     def reconcile(self, host) -> dict[str, str]:
@@ -409,6 +419,7 @@ def cmd_up(args) -> int:
     # before the world they poll is replaced, and the new bodies' runtimes follow.
     host.before_episode_load = lambda scenario: egos.depart(host, scenario)
     host.on_episode_loaded = lambda: egos.reconcile(host)
+    host.before_episode_reset = lambda: egos.retire(host)
     host.start()
     primary = next(iter(host.scenario["robots"]), None)
     print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
@@ -416,6 +427,7 @@ def cmd_up(args) -> int:
                       "robots": {rid: {"url": host.robot_servers[rid].url, "embodiment": body["id"],
                                        "egoApi": host.ego_apis.get(rid)} for rid, body in host.embodiments.items()},
                       "runDir": str(run_dir), "task": host.scenario["task"]}, ensure_ascii=False), flush=True)
+    host.dispatch_scenario_task()
 
     def pump(timeout: float) -> None:
         host.pump(timeout)
@@ -525,7 +537,7 @@ def cmd_cobot(args) -> int:
     host.attach_ego_api(robot_id, ego.url, skills=False)
 
     def sensed_frame() -> dict:
-        return decode_rgbd(sim.rgbd(robot_id, "top_camera")) if rgbd else sim.sensors(robot_id)
+        return decode_rgbd(sim.rgbd(robot_id, "wide_camera")) if rgbd else sim.sensors(robot_id)
 
     print(json.dumps({"console": f"{host.wca.url}/console", "wca": host.wca.url,
                       "robot": host.robot_servers[robot_id].url, "egoApi": ego.url,
@@ -542,17 +554,17 @@ def cmd_cobot(args) -> int:
         robot look again.
 
         Parking first is not cosmetic: a round ends with a hand over the object it just placed, and
-        the overhead camera then sees a forearm instead of the tabletop -- the next round would
+        the head cameras then see a forearm instead of the tabletop -- the next round would
         start blind. The objects' moves are world edits by the round driver, so the belief is told
         to start over rather than being left to decide on its own that they teleported."""
-        from steward.assets.cobot import HOME
+        from steward.assets.cobot import park
 
         try:
             # Command the park and let physics settle rather than waiting for a skill to converge:
-            # the point is only to get the forearms out of the overhead camera's way, and the next
+            # the point is only to get the forearms out of the head cameras' view, and the next
             # motion re-seeds its IK from the encoders anyway.
             for arm in ("L", "R"):
-                sim.command(robot_id, {"joints": dict(zip(skills.ik.joint_names(arm), HOME, strict=True))})
+                sim.command(robot_id, {"joints": dict(zip(skills.ik.joint_names(arm), park(arm), strict=True))})
             for entity_id, at in homes.items():
                 sim.edit_move(entity_id, {"at": {"x": at[0], "y": at[1], "z": at[2]}})
             sim.step_seconds(1.2)
@@ -862,6 +874,9 @@ def main(argv: list[str] | None = None) -> int:
         if not in_process:
             p.add_argument("--bind-wait", type=float, default=10.0,
                            help="seconds to wait for a fixed port still held by a service that just stopped")
+            p.add_argument("--body", choices=list(EMBODIMENTS), default=None,
+                           help="the body every episode's robot gets, whatever body its scenario was built with "
+                                "(switchable from the console); default: each scenario's own")
             p.add_argument("--pause-on-perception-fault", action=argparse.BooleanOptionalAction, default=True,
                            help="pause the world when the Observer finds a gross perception fault (phantom object, "
                                 "robot inside an object) until the operator acknowledges the alert")
@@ -869,11 +884,17 @@ def main(argv: list[str] | None = None) -> int:
                            help="DSH home of the World Harness used by the console chat; '' disables it")
             p.add_argument("--robot-harness", default=str(STEWARD_DIR / "var" / "dsh" / "robot-1"),
                            help="DSH home of the robot's Ego Harness used by the console chat; '' disables it")
+            p.add_argument("--turn-budget-s", type=float, default=TURN_BUDGET_S,
+                           help="wall seconds one console chat turn of a harness may run before it is ended; "
+                                "default: 24 days")
         if name == "world":
             p.add_argument("--ego-api", default="http://127.0.0.1:7420",
                            help="Ego API of the robot, for robot tasks from the console chat")
         if name == "up":
             p.add_argument("--api-port", type=int, default=7420)
+            p.add_argument("--dispatch-task", action=argparse.BooleanOptionalAction, default=True,
+                           help="start the robot's Ego Harness on the scenario's task, in a new conversation, "
+                                "at start and whenever the console loads or resets an episode")
         if name != "world":
             p.add_argument("--segmentation-config", default=str(SEGMENTATION_CONFIG),
                            help="robot-side segmenter settings, used at phase levels without world masks; '' disables it")
@@ -905,6 +926,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "ego":
             p.add_argument("--segmentation-config", default=str(SEGMENTATION_CONFIG),
                            help="robot-side segmenter settings, used at phase levels without world masks; '' disables it")
+            p.add_argument("--body", choices=list(EMBODIMENTS), default="steward-bot",
+                           help="the registered embodiment the runtime drives (its model, arm and motion settings)")
         if name == "cobot-ego":
             p.add_argument("--task", choices=COBOT_MISSIONS, default=None,
                            help="scripted mission the twin runs in its scene, round after round, each new "

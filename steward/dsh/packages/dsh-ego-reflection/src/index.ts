@@ -24,8 +24,11 @@
  *
  * Each model request gets the reasoning effort configured for the kind of step it follows:
  * `instruction` after an operator message, the reflection's depth after a reflection, `recover`
- * after a failure that got no reflection, `act` otherwise. Routine steps think briefly and
- * reflections think long. The effort is written to the request header of the Session log.
+ * after a failure that got no reflection, `act` otherwise. The effort is written to the request
+ * header of the Session log. The DeepSeek API caches prompt prefixes per effort: a request whose
+ * effort differs from the previous request's reads the cache left by the last request at its own
+ * effort and prefills everything after it, so a deployment that values time to first token
+ * configures one effort for all kinds and lets the reflection text ask for depth.
  *
  * - `agent/inbox/claimed`: an operator message (source `user`) joins the messages quoted by later
  *   reflections of that agent and resets its reflection history and budget.
@@ -84,7 +87,7 @@ export interface Config {
   actionTools: string[]
   /** Idle top-level calls in a row after which a checkpoint review is attached; 0: never. */
   idleEvery: number
-  /** Reasoning effort of the request following each kind of step. */
+  /** Reasoning effort of the request following each kind of step; differing efforts split the provider's prefix cache. */
   effort: Efforts
   /** Objects listed per reflection (the call's targets first, then candidates). */
   candidateLimit: number
@@ -292,7 +295,7 @@ export const CAUSES = [
   '   - 感知：物体是否被认错或叫错（感知按外观和形状命名，不知道操作员的叫法），是否只看到了一部分、被别的东西挡住、只看到了某一面；',
   '   - 物体的状态：位置、朝向、哪一面朝上、是否相互叠压或遮挡、数量是否齐全、是否离开了原来的地方；',
   '   - 参照：任务依据的参照物（印着目标的物体、标签、标记）是否被别的东西压住或遮挡、被翻面、被你自己挪动过，你看到的是否就是它；',
-  '   - 动作：够不着、抓不稳、会碰撞、放置的空间不够；',
+  '   - 动作：够不着、抓不稳、会碰撞、放置的空间不够（包括被你自己之前放下的东西占掉）；',
   '   - 任务理解：你对指令的理解和操作员的意思是否一致。',
 ]
 
@@ -304,6 +307,27 @@ export const SHALLOW_QUESTIONS = [
   '三、核实：用什么观察能以最小代价区分这些原因？',
   '四、下一步：怎样改，程序里怎样检验结果；不要原样重复失败的做法。',
 ]
+
+/**
+ * Questions for a program that failed to compile or threw a language error: fix the code, do not
+ * re-examine the physical scene.
+ */
+export const PROGRAM_QUESTIONS = [
+  '一、错误：程序哪里写错了（语法、变量重复声明、未定义的名字、类型不符）？',
+  '二、修正：怎样改写后重试；不要原样再提交同一段代码。',
+]
+
+/**
+ * Whether a failure message is a program language error rather than a robot-tool or physical
+ * failure. Syntax and reference errors get a short shallow reflection and never trigger a deep one.
+ * @param message - the failure text.
+ * @returns true when the message names a language error.
+ */
+export function isProgramError(message: string): boolean {
+  return /\b(SyntaxError|ReferenceError|TypeError|RangeError|EvalError|URIError)\b/.test(message)
+    || /Unexpected token|is not (defined|a function)|Cannot read propert|Identifier '.+' has already been declared|has already been declared/i
+      .test(message)
+}
 
 /**
  * Questions of a deep reflection: macro (scene, task, language, assumptions), then micro
@@ -320,7 +344,8 @@ export const DEEP_QUESTIONS = [
   '四、原因：设想一个人在真实环境里亲手做这件事，会在哪里遇到困难？用你对物理世界的常识列出至少三个可能的原因，不要只想一个。逐项检查：',
   ...CAUSES,
   '五、证据：每个可能的原因，用什么观察能以最小代价证实或排除？先核实，再行动。',
-  '六、前提：要顺利完成最终动作，世界先要处于什么状态（看得清、拿得到、彼此分开、齐全、朝向合适……）？是否应当先创造这些条件？',
+  '六、前提：要顺利完成最终动作，世界先要处于什么状态（看得清、拿得到、彼此分开、齐全、朝向合适、留有空地……）？是否应当先创造这些条件？'
+    + '你之前放下的东西（暂放的、倒出的、腾空的容器）有没有占掉后面步骤要用的台面、地面或机器人的路线，要不要先挪到边角？',
   '【策略】',
   '七、方法：退一步看，当前的方法从根本上可行吗？有没有完全不同的做法（换顺序、先创造前提、换观察位置、换技能组合）？比较代价和成功率。',
   '八、效率：哪些步骤在重复或只是微调参数？能否把剩下的工作写成一个程序循环完成，只在需要你判断时停下？',
@@ -339,7 +364,8 @@ export const RECURRING_QUESTIONS = [
 export const CHECKPOINT_QUESTIONS = [
   '一、进度：最终状态的各项条件，哪些已满足、哪些还没有？凭什么判断（列出检验过的结果，而不是计划）？',
   '二、方法：最近的程序是否在重复相似的工作或微调参数？剩下的工作能否写成一个程序循环完成，只在需要你判断时停下？',
-  '三、风险：有没有被忽略的异常迹象（数量对不上、物体移位、名字可疑、结果和预期不符）？',
+  '三、风险：有没有被忽略的异常迹象（数量对不上、物体移位、名字可疑、结果和预期不符）？'
+    + '已经放下的东西会不会让后面的步骤没有地方用，或挡住机器人的路线？',
   '四、下一步：做什么，怎样检验。',
 ]
 
@@ -383,22 +409,27 @@ export function reflectionText(failure: Failure, context: ReflectionContext,
   evidence: Reflection | { error: string }, config: Pick<Config, 'candidateLimit' | 'failureMaxChars'>): string {
   const what = clip(failure.message, config.failureMaxChars)
   const deep = context.depth === 'deep'
+  const programBug = !deep && isProgramError(failure.message)
   const title = deep ? '【深度反思】' : '【反思】'
   const lines = [failure.tool === REFLECT_TOOL ? `${title}你遇到的困难：${what}` : `${title}${failure.tool} 失败：${what}`]
   if (context.trigger) lines.push(`为什么深入反思：${context.trigger}`)
   lines.push(...instructionLines(context.instructions))
   if (context.history.length) lines.push('这条指令下之前的失败：', ...context.history.map(h => `- ${h}`))
   if (deep && context.scene?.length) lines.push(`当前场景（Ego State 摘要，这条指令下已运行 ${context.steps} 个程序）：`, ...context.scene)
-  lines.push(...evidenceLines(evidence, config.candidateLimit))
+  if (!programBug) lines.push(...evidenceLines(evidence, config.candidateLimit))
   if (deep) {
-    lines.push(`这是这条指令下的第 ${context.ordinal} 次反思，是一次深度反思。先在思考中充分推敲，再分层逐条作答，每条几句话：`)
+    lines.push(`这是这条指令下的第 ${context.ordinal} 次反思，是一次深度反思。先在思考中充分推敲，再分层逐条作答，每条一两句话：`)
     if (context.ordinal > 1) lines.push(...RECURRING_QUESTIONS)
     lines.push(...DEEP_QUESTIONS)
+  } else if (programBug) {
+    lines.push(`这是程序本身的错误，不是机器人动作失败。用一两句话回答后改程序重试：`, ...PROGRAM_QUESTIONS)
   } else {
-    lines.push(`这是这条指令下的第 ${context.ordinal} 次反思。下一次行动之前，用几句话逐条回答：`, ...SHALLOW_QUESTIONS,
+    lines.push(`这是这条指令下的第 ${context.ordinal} 次反思。下一次行动之前，逐条回答，每条一句话：`, ...SHALLOW_QUESTIONS,
       '同一类失败再次出现时，会进入深度反思。')
   }
-  lines.push('需要时用 ego_candidates（传入指令里的名字和大小）、ego_inspect、ego_observe 或靠近观察核实，用 ego_annotate 改正物体的名字和可供性。')
+  if (!programBug) {
+    lines.push('需要时用 ego_candidates（传入指令里的名字和大小）、ego_inspect、ego_observe 或靠近观察核实，用 ego_annotate 改正物体的名字和可供性。')
+  }
   return lines.join('\n')
 }
 
@@ -417,7 +448,7 @@ export function checkpointText(context: Pick<ReflectionContext, 'instructions' |
       : `【阶段回顾】这条指令下已运行 ${context.steps} 个程序，自上次反思以来的 ${context.since} 个程序没有工具报错。`,
     ...instructionLines(context.instructions),
     ...context.scene?.length ? ['当前场景（Ego State 摘要）：', ...context.scene] : [],
-    '用几句话逐条回答，再继续：',
+    '逐条回答，每条一句话，再继续：',
     ...idle ? IDLE_QUESTIONS : CHECKPOINT_QUESTIONS,
   ].join('\n')
 }
@@ -508,16 +539,16 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  const note = (state: AgentState, depth: Depth) => {
+  const note = (state: AgentState, depth: Depth, countTowardDeep = true) => {
     state.reflections += 1
     state.quiet = 0
     if (depth === 'deep') [state.deep, state.shallowSinceDeep] = [state.deep + 1, 0]
-    if (depth === 'shallow') state.shallowSinceDeep += 1
+    if (depth === 'shallow' && countTowardDeep) state.shallowSinceDeep += 1
     if (state.pending === undefined || RANK[depth] > RANK[state.pending]) state.pending = depth
   }
 
   const reflect = async (state: AgentState, failure: Failure, report: FailureReport, depth: 'shallow' | 'deep',
-    trigger: string | undefined, signal: AbortSignal): Promise<string> => {
+    trigger: string | undefined, signal: AbortSignal, countTowardDeep = true): Promise<string> => {
     let evidence: Reflection | { error: string }
     try {
       evidence = await ego.reflect(report, signal)
@@ -529,23 +560,27 @@ export function apply(ctx: Context, config: Config) {
       ...trigger === undefined ? {} : { trigger }, steps: state.steps,
       ...depth === 'deep' ? { scene: await scene(signal) } : {},
     }, evidence, config)
-    note(state, depth)
+    note(state, depth, countTowardDeep)
     state.history.push(`${failure.tool}：${clip(failure.message, config.historyMaxChars)}`)
     while (state.history.length > config.historyLimit) state.history.shift()
     return text
   }
 
   /** The depth a failure gets and why, or undefined when it gets no reflection. */
-  const depthOf = (state: AgentState, failure: Failure): { depth: 'shallow' | 'deep', trigger?: string } | undefined => {
+  const depthOf = (state: AgentState, failure: Failure):
+    { depth: 'shallow' | 'deep', trigger?: string, countTowardDeep?: boolean } | undefined => {
     if (state.reflections >= config.maxPerInstruction) return undefined
+    const programBug = programs.has(failure.tool) && isProgramError(failure.message)
     const deepLeft = state.deep < config.maxDeepPerInstruction
     const seen = state.signatures.get(signature(failure))
     if (seen !== undefined) {
-      if (seen.deep || !deepLeft) return undefined
+      // A repeated language error stays a short fix; do not escalate to a deep scene review.
+      if (programBug || seen.deep || !deepLeft) return undefined
       seen.deep = true
       return { depth: 'deep', trigger: '同样的失败又出现了一次：换个角度重新理解任务和场景，而不是再调整参数。' }
     }
     state.signatures.set(signature(failure), { deep: false })
+    if (programBug) return { depth: 'shallow', countTowardDeep: false }
     if (deepLeft && state.shallowSinceDeep >= config.deepAfter) {
       return { depth: 'deep', trigger: `前 ${state.shallowSinceDeep} 次反思之后任务仍然受阻：检查对任务的理解、假设和方法本身。` }
     }
@@ -601,7 +636,8 @@ export function apply(ctx: Context, config: Config) {
         tool: failure.tool,
         arguments: receipt ? { ...failure.arguments, params: receipt } : failure.arguments,
         message: failure.message,
-      }, chosen.depth, chosen.trigger, exec.signal) }], source: { kind: 'ego-reflection' } }))
+      }, chosen.depth, chosen.trigger, exec.signal, chosen.countTowardDeep !== false) }],
+        source: { kind: 'ego-reflection' } }))
     }
     if (actions.has(exec.name)) state.acted = true
     if (top) {

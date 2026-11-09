@@ -17,9 +17,9 @@ import pytest
 from PIL import Image
 
 from steward.assets.generators import steward_bot
-from steward.authoring.service import PUZZLE_PIECE_M, AuthoringService
-from steward.ego.estimator import EgoEstimator, Track
-from steward.ego.perception import top_face
+from steward.authoring.service import PUZZLE_PIECE_M, AuthoringService, puzzle_box_m
+from steward.ego.estimator import Appearance, EgoEstimator, Track
+from steward.ego.perception import face_colour_stats, top_face
 from steward.ego.runtime import EgoRuntime, RobotLink
 from steward.ego.server import ego_api
 from steward.math3d import quat_rotate, wrap_angle
@@ -52,14 +52,14 @@ def test_the_four_by_four_pieces_lie_inside_their_box_and_the_pour_spot_fits_the
     sim = WorldSim(_scenario(kitchen_root, "puzzle-dog")["sceneState"])
     sim.step_seconds(0.5)
     box = sim._entity_pose("w:box")["p"]
-    half_box = (4 * PUZZLE_PIECE_M + 5 * 0.012 + 0.02) / 2
+    half_box = puzzle_box_m(4) / 2
     for r in range(4):
         for c in range(4):
             p = sim._entity_pose(f"w:piece-{r}{c}")["p"]
             assert abs(p[0] - box[0]) < half_box and abs(p[1] - box[1]) < half_box
     table = next(e for e in _scenario(kitchen_root, "puzzle-dog")["sceneState"]["entities"] if e["id"] == "w:table-1")
-    assert table["asset"]["id"] == "puzzle-table-240x115"
-    assert 1.15 / 2 > half_box + EsimConfig().pour_spill
+    assert table["asset"]["id"] == "puzzle-table-180x57"
+    assert 0.575 / 2 > half_box + EsimConfig().pour_spill_sizes * PUZZLE_PIECE_M
 
 
 def test_a_printed_board_shows_its_picture_on_top_with_image_up_towards_plus_y(kitchen_root):
@@ -131,6 +131,32 @@ def test_a_pourable_box_is_grasped_with_its_contents_only_without_its_lid_and_ca
     assert rise > 0.08
     assert all(sim._entity_pose(f"w:piece-{r}{c}")["p"][2] - box[2] > 0.08 for r in range(3) for c in range(3)), \
         "the pieces rise with the box"
+
+
+def test_fingers_take_a_piece_beside_the_box_wall_the_box_by_its_rim_and_nothing_through_a_lid(kitchen_root):
+    sim = WorldSim(_scenario(kitchen_root)["sceneState"])
+    sim.step_seconds(0.5)  # settled: what rests on what comes from the contacts
+    rs = sim.robots["w:robot-1"]
+    link, g = next(iter(rs.grippers.items()))
+
+    def close_at(point) -> str | None:
+        sim.grasp_point = lambda robot, gripper=None: {"p": list(point), "q": [1.0, 0.0, 0.0, 0.0]}
+        g.attached = g.handle = None
+        sim._try_attach(rs, g, link)
+        return g.attached
+
+    box = sim.entity_obb("w:box")
+    corner = min((f"w:piece-{r}{c}" for r in range(3) for c in range(3)),
+                 key=lambda p: sim._entity_pose(p)["p"][0])  # one of the pieces nearest the box's -x wall
+    piece = sim._entity_pose(corner)["p"]
+    assert close_at(piece) is None, "under the lid nothing in the box can be taken"
+    sim.edit_move("w:lid", {"at": {"x": 2.0, "y": 1.5}})
+    sim.step_seconds(0.5)
+    assert close_at(sim._entity_pose(corner)["p"]) == corner, "on a piece's middle by the wall: the piece, not the box"
+    from steward.ego.esim import EsimConfig
+
+    rim = [box.center[0] - box.size[0] / 2 + EsimConfig().edge_grasp_inset, box.center[1], box.center[2]]
+    assert close_at(rim) == "w:box", "on the rim, the wall between the fingers: the box"
 
 
 def _track(oid, category, pos, size, observations=10, yaw=0.0):
@@ -231,6 +257,7 @@ def test_a_detection_of_a_neighbour_does_not_take_the_track_of_the_piece_beside_
     from steward.math3d import pose_compose, pose_inverse
 
     est = EgoEstimator(robot_model=steward_bot().to_dict())
+    est.tracks["e:1"] = _track("e:1", "table", [0.6, 0.0, 0.375], [1.0, 0.6, 0.75])
     est.tracks["e:50"] = _track("e:50", "puzzle_piece", [0.627, 0.0, 0.76], [0.115, 0.115, 0.006])
     odometry = {"x": 0.0, "y": 0.0, "yaw": 0.0, "sigma": {"pos": 0.003, "yaw": 0.003}}
     est.odometry = odometry
@@ -244,7 +271,7 @@ def test_a_detection_of_a_neighbour_does_not_take_the_track_of_the_piece_beside_
     # the piece it lies on.
     est.update({"stamp": 1.0, "odometry": odometry, "joints": {}, "gripper": {"state": "open", "holding": False},
                 "detections": [det(0.5, 0.2), det(0.627, 0.9)]})
-    tracks = sorted(est.tracks.values(), key=lambda t: t.pos[0])
+    tracks = sorted((t for t in est.tracks.values() if t.category == "puzzle_piece"), key=lambda t: t.pos[0])
     assert len(tracks) == 2 and tracks[1].id == "e:50"
     assert tracks[0].pos[0] == pytest.approx(0.5, abs=0.01) and tracks[1].pos[0] == pytest.approx(0.627, abs=0.01)
 
@@ -266,8 +293,8 @@ def test_top_face_reads_a_face_in_the_object_frame_and_hides_what_is_occluded():
 
 
 @pytest.mark.parametrize(("scenario", "side", "lid_at", "pour_at", "min_out"), [
-    ("puzzle-cat", 3, [0.72, 0.22], [0.2, 0.0], 7),
-    ("puzzle-dog", 4, [0.85, 0.2], [0.0, -0.03], 12),
+    ("puzzle-cat", 3, [0.34, 0.0], [0.1, 0.0], 7),
+    ("puzzle-dog", 4, [0.40, 0.05], [0.0, 0.0], 12),
 ])
 def test_the_robot_takes_off_the_lid_and_pours_the_pieces_out_onto_the_table(kitchen_root, tmp_path, scenario, side,
                                                                               lid_at, pour_at, min_out):
@@ -293,17 +320,17 @@ def test_the_robot_takes_off_the_lid_and_pours_the_pieces_out_onto_the_table(kit
         try:
             runtime.start()
             _explore(api.url, 120)
-            table, lid = track_of("w:table-1", 1.0), track_of("w:lid", 0.3)
+            table, lid = track_of("w:table-1", 0.5), track_of("w:lid", 0.15)
             _approach_to_observe(api.url, lid, 1.0)
-            lid = track_of("w:lid", 0.3)
+            lid = track_of("w:lid", 0.15)
             assert call("POST", f"{api.url}/ego/inspect", {"entity": lid["id"], "px": 16})["coverage"] > 0.8
             call("POST", f"{api.url}/ego/annotate", {"entity": lid["id"], "affordances": ["graspable", "flat"]})
             out["lid"] = [run("pick", {"target": lid["id"]}), run("place", {"on": table["id"], "offset": lid_at})]
-            box = track_of("w:box", 0.3)
+            box = track_of("w:box", 0.15)
             call("POST", f"{api.url}/ego/annotate", {"entity": box["id"], "label": "box",
                                                        "affordances": ["graspable", "container", "receptacle", "pourable"]})
             out["box"] = [run("pick", {"target": box["id"]}), run("pour", {"on": table["id"], "offset": pour_at}),
-                          run("place", {"on": table["id"]})]
+                          run("place", {"at": [-0.6, -0.6]})]
         except Exception:  # noqa: BLE001 - reported by the assertions below
             out["error"] = traceback.format_exc()
         finally:
@@ -322,7 +349,7 @@ def test_the_robot_takes_off_the_lid_and_pours_the_pieces_out_onto_the_table(kit
         fallen = [w for w in pieces if host.sim._entity_pose(w)["p"][2] < 0.7]
         assert not fallen, f"no piece slides off the table: {fallen}"
         box_xy = np.array(host.sim._entity_pose("w:box")["p"][:2])
-        beyond_box = (side * PUZZLE_PIECE_M + (side + 1) * 0.012 + 0.02) / 2 + 0.04
+        beyond_box = puzzle_box_m(side) / 2 + 0.04
         out_of_box = [w for w in pieces
                       if np.linalg.norm(np.array(host.sim._entity_pose(w)["p"][:2]) - box_xy) > beyond_box
                       and host.sim._entity_pose(w)["p"][2] > 0.7]
@@ -508,7 +535,7 @@ def test_a_pour_spot_keeps_the_contents_slide_from_every_edge_of_the_surface():
     es = est.to_scene()
     table, box = es.find("e:4"), es.find("e:2")
     esim = Esim(model)
-    keep = 0.205 + esim.config.pour_spill
+    keep = 0.205 + 0.25
     spot, _ = esim._choose_spot(es, table, entity_box(table)[0], box, entity_box(box)[0], None, 0.0, 0.015, edge_keep=keep)
     assert esim._edge_distance(entity_box(table)[0], spot) >= keep - 1e-9
     with pytest.raises(PredictionError, match="of the edge"):
@@ -574,6 +601,7 @@ def test_a_remembered_face_gathers_views_and_is_replaced_after_the_object_is_put
     track = est.tracks["e:3"]
     cols, rows = est.face_grid(track, 0.005)
     assert (cols, rows) == (23, 23)
+    assert est.face_grid(track, 0.002) == (58, 58), "the default 2 mm cell resolves a piece into dozens of cells"
     left, right = np.full((rows, cols, 3), np.nan), np.full((rows, cols, 3), np.nan)
     left[:, :12], right[:, 12:] = 100.0, 200.0
     est.remember_face("e:3", left, 1.0)
@@ -586,6 +614,36 @@ def test_a_remembered_face_gathers_views_and_is_replaced_after_the_object_is_put
     assert track.appearance.stale, "put down, it may lie turned over"
     est.remember_face("e:3", left, 3.0)
     assert track.appearance.coverage == pytest.approx(12 / 23) and not track.appearance.stale
+
+
+def test_interior_face_stats_ignore_a_neighbour_tinting_the_edge():
+    plain = [[[200, 200, 200]] * 8 for _ in range(8)]
+    assert face_colour_stats(plain)["interiorSpread"] == 0.0 and face_colour_stats(plain)["plain"]
+    edged = [list(row) for row in plain]
+    for i in range(8):
+        edged[0][i] = edged[i][0] = [40, 180, 40]  # a neighbour's green along two edges
+    stats = face_colour_stats(edged)
+    assert stats["spread"] > 20 and stats["interiorSpread"] == 0.0 and stats["plain"]
+    rgb = np.full((8, 8, 3), 200.0)
+    rgb[0, :], rgb[:, 0] = 40.0, 40.0
+    track = _track("e:3", "puzzle_piece", [0.5, 0.0, 0.753], [0.115, 0.115, 0.006])
+    track.appearance = Appearance(rgb, (0.115, 0.115), 1.0)
+    assert track.appearance.spread > 20 and track.appearance.interior_spread == 0.0
+    assert track.appearance.plain and track.appearance.interior_colors == 1
+
+
+def test_a_lit_cardboard_back_is_plain_while_a_printed_face_is_not():
+    """Lighting gradients inflate RGB std on a one-colour back; colour-bucket count still tells them apart."""
+    back = []
+    for i in range(12):
+        shade = 140 + i * 8  # bright-to-dark gradient like a table lamp
+        back.append([[shade, int(shade * 0.85), int(shade * 0.62)]] * 12)
+    back_stats = face_colour_stats(back)
+    assert back_stats["interiorSpread"] > 20 and back_stats["plain"] and back_stats["interiorColors"] <= 12
+    rng = np.random.default_rng(0)
+    print_face = rng.integers(0, 256, (12, 12, 3)).tolist()
+    print_stats = face_colour_stats(print_face)
+    assert not print_stats["plain"] and print_stats["interiorColors"] > 20
 
 
 def test_a_fine_face_averages_into_coarser_cells_over_the_same_extent():

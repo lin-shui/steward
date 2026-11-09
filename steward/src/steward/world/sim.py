@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import io
+import itertools
 import json
 import math
 import queue
@@ -38,6 +39,8 @@ HIDDEN_GROUP = 4  # not drawn by MuJoCo's default visualisation options
 HOLD_LEASE_S = 2.0  # wall seconds a hold may go unseen (its owner neither waiting nor done) before the world ignores it
 _JOINT_WIDTH = {int(mujoco.mjtJoint.mjJNT_FREE): (7, 6), int(mujoco.mjtJoint.mjJNT_BALL): (4, 3),
                 int(mujoco.mjtJoint.mjJNT_SLIDE): (1, 1), int(mujoco.mjtJoint.mjJNT_HINGE): (1, 1)}
+# Shared by every simulation of the process, so a newly loaded scenario never repeats a number.
+_EPISODES = itertools.count(1)
 
 
 _COLOR_NAMES = {
@@ -78,6 +81,7 @@ class PerceptionConfig:
     min_mask_pixels: int = 25
     pos_sigma_base: float = 0.01
     pos_sigma_per_m: float = 0.02
+    pos_sigma_rows: int = 240  # image rows the pos_sigma_* figures hold for: a camera with more rows localises finer in proportion
     size_sigma_rel: float = 0.03
     yaw_sigma: float = 0.05
     odom_pos_sigma: float = 0.003
@@ -95,6 +99,18 @@ class GraspConfig:
     capture_radius: float = 0.06
     handle_kp: float = 3000.0
     handle_kd: float = 120.0
+
+
+def _at_edge(obb, point: np.ndarray, band: float = 0.03, finger: float = 0.015) -> bool:
+    """Whether fingers closing at ``point`` close on an oriented box's edge, the wall between them:
+    inside it no deeper than ``band`` (a gripper's width) from a side face -- deeper, they close on
+    what lies inside it -- or outside it by no more than a finger's thickness."""
+    local = np.abs(matrix_from_quat(obb.quat).T @ (np.asarray(point, float) - np.asarray(obb.center)))
+    half = np.asarray(obb.size) / 2
+    outside = float(np.linalg.norm(np.maximum(local - half, 0.0)))
+    if outside > 0.0:
+        return outside <= finger
+    return float(np.min(half[:2] - local[:2])) <= band
 
 
 def _under(obb, point: np.ndarray) -> bool:
@@ -214,6 +230,7 @@ class WorldSim:
 
     # ------------------------------------------------------------------ setup
     def _load(self, scene_dict: dict) -> None:
+        self.episode = next(_EPISODES)
         self.template = SceneState.from_dict(scene_dict)
         cameras = [self._overview or self._default_overview()]
         self.build: MjcfBuild = build_mjcf(self.template, timestep=self.timestep, extra_cameras=cameras,
@@ -699,13 +716,15 @@ class WorldSim:
         return pose
 
     def _try_attach(self, rs: _RobotState, g: _GripState, gripper_link: str) -> None:
-        """Ideal grasp: attach the nearest free object within capture range that has nothing resting
-        on or in it (the top of a stack) or is a pourable container (carried with what lies in it), or else
+        """Ideal grasp: attach the nearest free object within capture range of the pinch point (inside
+        it, or that close to its box: a large object is taken by its edge) that has nothing resting on or
+        in it (the top of a stack) or is a pourable container (carried with what lies in it), or else
         grasp the nearest drawer handle."""
         grip = np.asarray(self.grasp_point(rs.entity_id, gripper_link)["p"])
-        supporting = {r.b["entity"] for r in self._relations()
-                      if r.type == "supported-by" and self.template.entity(r.a["entity"]).rigid.root.value == "free"}
-        best, best_d, best_top = None, self.grasp.capture_radius, -math.inf
+        relations = [r for r in self._relations() if r.type == "supported-by"]
+        supporting = {r.b["entity"] for r in relations if self.template.entity(r.a["entity"]).rigid.root.value == "free"}
+        container = {r.a["entity"]: r.b["entity"] for r in relations}
+        candidates = []
         for ent in self.template.entities:
             if ent.role != "object" or ent.rigid.root.value != "free":
                 continue
@@ -714,14 +733,32 @@ class WorldSim:
             if any(other.holding_any(ent.id) for other in self.robots.values()):
                 continue
             obb = entity_obb(self.model, self.data, self.build.names[ent.id])
+            holder = container.get(ent.id)
+            if holder is not None and _is_pourable(self.template.entity(holder)) and self._covered(holder):
+                box = self.entity_obb(holder)
+                if obb.center[2] - obb.size[2] / 2 < box.center[2] + box.size[2] / 2 - 0.01:
+                    continue  # inside a closed box: the fingers meet its lid
             d = float(np.linalg.norm(np.asarray(obb.center) - grip))
-            if d > self.grasp.capture_radius:
+            centred = d <= self.grasp.capture_radius
+            if not centred and not _at_edge(obb, grip):
                 continue
-            # Closing from above, the gripper meets the topmost object under it first (a lid before
-            # the pieces in the box); elsewhere the nearest object.
-            top = obb.center[2] + obb.size[2] / 2 if _under(obb, grip) else -math.inf
-            if (top, -d) > (best_top, -best_d):
-                best, best_d, best_top = ent.id, d, top
+            candidates.append((ent.id, obb, d, centred, not centred and _is_pourable(ent)))
+        # Fingers closing on an object's middle take it before the rim of another they are near
+        # (a piece in its box, not the box), but straddling the wall of a pourable container they
+        # take the wall, not what lies inside it against the wall nor an object beside it they are
+        # not over (a piece smaller than the capture radius by the wall); closing from above, the
+        # gripper meets the topmost object under it first (a lid before the pieces in the box);
+        # elsewhere the nearest one.
+        walls = {ent_id for ent_id, _, _, _, wall in candidates if wall}
+        best, best_rank = None, None
+        for ent_id, obb, d, centred, _ in candidates:
+            if container.get(ent_id) in walls:
+                continue
+            over = _under(obb, grip)
+            top = obb.center[2] + obb.size[2] / 2 if over else -math.inf
+            rank = (centred and (over or not walls), top, -d)
+            if best_rank is None or rank > best_rank:
+                best, best_rank = ent_id, rank
         if best is None:
             handle = self._nearest_handle(grip)
             if handle is not None:
@@ -952,7 +989,8 @@ class WorldSim:
     def sensors(self, robot_id: str) -> dict:
         """One sensor frame for a robot: odometry, joint encoders, gripper, its cameras and, without
         raw imaging, the ideal detections of every camera (each carries the ``camera`` it came from
-        and a pose relative to it; an object two cameras see is reported by the first)."""
+        and a pose relative to it; an object two cameras see is reported by the first).
+        ``episode`` changes with every load and reset, which the robot experiences as a reboot."""
         with self.lock:
             rs = self._robot(robot_id)
             names = self.build.names[robot_id]
@@ -974,6 +1012,7 @@ class WorldSim:
                      for lid, g in rs.grippers.items()}
             frame = {
                 "stamp": self.time,
+                "episode": self.episode,
                 "odometry": odom,
                 "joints": joints,
                 "grippers": grips,
@@ -1006,7 +1045,7 @@ class WorldSim:
                            "holding": g.attached is not None or g.handle is not None,
                            "holdingHandle": g.handle is not None}
                      for lid, g in rs.grippers.items()}
-            frame = {"stamp": self.time, "joints": joints, "grippers": grips}
+            frame = {"stamp": self.time, "episode": self.episode, "joints": joints, "grippers": grips}
             if len(grips) == 1:
                 frame["gripper"] = next(iter(grips.values()))
             else:
@@ -1198,7 +1237,7 @@ class WorldSim:
                 continue
             rel = pose_compose(cam_inv, obb.pose())
             rng_m = float(np.linalg.norm(rel["p"]))
-            sigma = p.pos_sigma_base + p.pos_sigma_per_m * rng_m
+            sigma = (p.pos_sigma_base + p.pos_sigma_per_m * rng_m) * p.pos_sigma_rows / sensor["intrinsics"]["height"]
             noisy_p = [rel["p"][i] + rng.normal(0, sigma) for i in range(3)]
             noisy_q = quat_normalize(quat_mul(rel["q"], quat_from_yaw(rng.normal(0, p.yaw_sigma))))
             size = [max(0.005, s * (1 + rng.normal(0, p.size_sigma_rel))) for s in obb.size]

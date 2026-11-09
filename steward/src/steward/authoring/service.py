@@ -19,6 +19,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from steward.assets.cobot import ARM_MOUNT_X
 from steward.assets.generators import GENERATORS
 from steward.assets.library import AssetLibrary, instantiate
 from steward.assets.preview import render_scene, render_template
@@ -388,22 +389,32 @@ class Puzzle:
     image: str
     subject: str
     grid: int
-    table_m: tuple[float, float] = (2.0, 1.0)
+    table_m: tuple[float, float] = (1.0, 0.5)
+    box_from_end_m: float = 0.15
+    """Distance from the table's -x end to the box centre."""
 
 
-# A pour spot keeps the box half side + the robot's 0.25 m pour spill from every table edge, so a 4 × 4
-# box needs a table at least 1.04 m deep; the robot reaches 0.59 m in from the edge it docks at, so a
-# table up to 1.18 m deep is reachable everywhere from its two long sides.
+# Tables and pieces are half the size of a real dining-table puzzle, so that an arm of short reach
+# (the Cobot's Piper) reaches every spot of the table from its long sides. The dog's box stands far
+# enough from the table's end for the robot to dock square in front of it: taken by its rim from
+# the side, the box turns in the gripper while it is carried.
 PUZZLES = {
     "cat": Puzzle("cat.jpg", "猫", 3),
     "greatwall": Puzzle("great-wall.jpg", "长城", 3),
-    "dog": Puzzle("dog.jpg", "狗", 4, (2.4, 1.15)),
+    "dog": Puzzle("dog.jpg", "狗", 4, (1.8, 0.575), 0.45),
 }
-PUZZLE_PIECE_M = 0.115
+PUZZLE_PIECE_M = 0.0575
+PUZZLE_GAP_M = 0.006  # between the pieces in the box, and between them and its walls
+PUZZLE_BOX_WALL_M = 0.005  # wall of the box; the lid overhangs it by as much on each side
 PUZZLE_TASK = ("餐桌上有一盒拼图，盒盖上印着拼好后的完整图案（{subject}）。盒子上写着：共 {count} 片，"
                "拼好后 {size_cm:.1f} 厘米见方，和盒盖上印的图一样大。打开盒子，把盒子里的拼图块倒在桌上，"
                "再把这些拼图块在桌上拼成和盒盖上一样的图案，拼时每块的图案面都要朝上。")
 PUZZLE_LID_BORDER_RGB = (236, 232, 224)
+
+
+def puzzle_box_m(grid: int) -> float:
+    """Outer side of the box holding ``grid`` × ``grid`` pieces."""
+    return grid * PUZZLE_PIECE_M + (grid + 1) * PUZZLE_GAP_M + 2 * PUZZLE_BOX_WALL_M
 
 
 def png_b64(image, size: int) -> str:
@@ -443,12 +454,12 @@ def puzzle_spec(name: str, image: str, seed: int) -> tuple[list[tuple[str, str, 
     n = puzzle.grid
     table_w, table_d = puzzle.table_m
     table = f"puzzle-table-{round(table_w * 100)}x{round(table_d * 100)}"
-    box_w = n * PUZZLE_PIECE_M + (n + 1) * 0.012 + 0.02
-    lid_w = box_w + 0.02
+    box_w = puzzle_box_m(n)
+    lid_w = box_w + 2 * PUZZLE_BOX_WALL_M
     full, pieces = puzzle_textures(puzzle.image, lid_w, n)
     assets = [
         (table, "dining_table", {"width": table_w, "depth": table_d}),
-        (f"{name}-box", "open_box", {"width": box_w, "depth": box_w}),
+        (f"{name}-box", "open_box", {"width": box_w, "depth": box_w, "wall": PUZZLE_BOX_WALL_M}),
         (f"{name}-lid", "printed_board", {"width": lid_w, "depth": lid_w, "thickness": 0.008,
                                           "texture": full, "mass": 0.08, "category": "lid"}),
     ]
@@ -460,12 +471,12 @@ def puzzle_spec(name: str, image: str, seed: int) -> tuple[list[tuple[str, str, 
     rng = np.random.default_rng(seed)
     order = rng.permutation(n * n)
     turns = rng.integers(0, 4, n * n)
-    pitch = PUZZLE_PIECE_M + 0.012
+    pitch = PUZZLE_PIECE_M + PUZZLE_GAP_M
     middle = (n - 1) / 2
     entities = [
         {"id": "w:room", "asset": "kitchen-room", "at": {"x": 0.0, "y": 0.0}},
         {"id": "w:table-1", "asset": table, "at": {"x": 0.5, "y": -0.6}},
-        {"id": "w:box", "asset": f"{name}-box", "on": "w:table-1", "offset": [0.3 - table_w / 2, 0.15]},
+        {"id": "w:box", "asset": f"{name}-box", "on": "w:table-1", "offset": [puzzle.box_from_end_m - table_w / 2, 0.075]},
     ]
     for slot, k in enumerate(order):
         r, c = divmod(int(k), n)
@@ -549,9 +560,9 @@ def build_default_kitchen(service: AuthoringService) -> dict:
 def cobot_spec() -> dict:
     """The Cobot Magic workstation: the twin parked at a tabletop, a bowl and a plate on it.
 
-    The table's near edge sits at x = 0.40, just in front of the chassis (half-length 0.34), so
-    the twin works the band its arms can reach over the edge (measured: x 0.40-0.60 at y +-0.45,
-    strictly vertical only in the nearest part of it). The bowl and the plate stand on the same
+    The twin starts with its arm mounts at x = 0 (its chassis centre ``ARM_MOUNT_X`` behind) and
+    the table's near edge at x = 0.40, so the twin works the band its arms can reach over the edge
+    (measured: x 0.40-0.60 at y +-0.45, strictly vertical only in the nearest part of it). The bowl and the plate stand on the same
     arm's side: the errand is one arm's job, pick and place both.
     """
     return {
@@ -559,7 +570,7 @@ def cobot_spec() -> dict:
         "entities": [
             {"id": "w:room", "asset": "cobot-room", "at": {"x": 0.0, "y": 0.0}},
             {"id": "w:table-1", "asset": "cobot-table", "at": {"x": 0.85, "y": 0.0}},
-            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
+            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": -ARM_MOUNT_X, "y": 0.0}},
             # Table centre is (0.85, 0); both pieces stand on the left arm's side (the mission is
             # one arm's errand), fully on the tabletop and clear of each other's footprint --
             # verified against the solver, see tests/test_cobot_table.py.
@@ -577,7 +588,7 @@ def cobot_kitchen_spec() -> dict:
     """The chores kitchen's tableware on one table the twin is parked at.
 
     The same three nesting bowls (30, 20 and 12 cm), wine glass and black mug as the chores
-    kitchen. The table's near edge sits at x = 0.38, just in front of the chassis; every piece
+    kitchen. The table's near edge sits at x = 0.38 ahead of the arm mounts (at x = 0); every piece
     stands in the strip the arms reach over that edge (measured: x 0.38-0.60, and y +-0.25 puts a
     piece in front of one arm rather than between both). The largest bowl stands on the left
     arm's line because stacking happens along that line, the other two on the arms that carry
@@ -587,7 +598,7 @@ def cobot_kitchen_spec() -> dict:
         "name": "cobot-kitchen",
         "entities": [
             {"id": "w:room", "asset": "kitchen-room", "at": {"x": 0.0, "y": 0.0}},
-            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
+            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": -ARM_MOUNT_X, "y": 0.0}},
             {"id": "w:table-1", "asset": "cobot-kitchen-table", "at": {"x": 0.90, "y": 0.0}},
             # Every piece is fully on the tabletop (near edge x = 0.35) and inside the strip the
             # arms reach over it (x 0.40-0.60): a cylinder resting on one contact point tips.
@@ -597,7 +608,7 @@ def cobot_kitchen_spec() -> dict:
             {"id": "w:bowl-green", "asset": "bowl-green-medium", "on": "w:table-1", "offset": [-0.45, 0.38]},
             {"id": "w:bowl-blue", "asset": "bowl-blue-small", "on": "w:table-1", "offset": [-0.44, -0.28]},
             # The glass and the mug are left alone by this task: they stand on the far half, out of
-            # the arms' strip but inside the overhead camera's view.
+            # the arms' strip but inside the head cameras' view.
             {"id": "w:wine-glass", "asset": "wine-glass", "on": "w:table-1", "offset": [0.20, -0.30]},
             {"id": "w:mug", "asset": "black-mug", "on": "w:table-1", "offset": [0.20, 0.30]},
         ],
@@ -660,8 +671,8 @@ def build_cobot_kitchen(service: AuthoringService) -> dict:
     assets = {
         "kitchen-room": KITCHEN_ASSETS["kitchen-room"],
         "cobot-magic": ("cobot_magic", {}),
-        # 0.8 x 0.8 under the overhead camera's cone: the whole top has to be inside the frame,
-        # or the table never becomes a track (see assets/cobot.py's top_camera note).
+        # Small enough that the whole top is inside the work camera's frame from where the robot
+        # parks: a region cut by the image border never becomes a track.
         "cobot-kitchen-table": ("dining_table", {"width": 1.2, "depth": 1.0}),
         "bowl-red-large": KITCHEN_ASSETS["bowl-red-large"],
         "bowl-green-medium": KITCHEN_ASSETS["bowl-green-medium"],
@@ -690,8 +701,9 @@ def build_cobot_kitchen(service: AuthoringService) -> dict:
 # corner (0.45 m) still clears the counter's front at 2.70, and the last 0.30 m is a straight
 # drive into the working pose, which is how a real base parks against a counter.
 COBOT_ERRAND_MISSION = {
-    "drive": {"at": [2.30, 0.0, 0.0],
-              "path": [[-0.20, -1.10], [2.00, -1.10], [2.00, 0.0], [2.30, 0.0]]},
+    "drive": {"at": [2.30 - ARM_MOUNT_X, 0.0, 0.0],
+              "path": [[-0.20 - ARM_MOUNT_X, -1.10], [2.00 - ARM_MOUNT_X, -1.10], [2.00 - ARM_MOUNT_X, 0.0],
+                       [2.30 - ARM_MOUNT_X, 0.0]]},
     # The counter's top (0.90) plus the bowl's half height and the 3 cm it is released above it.
     "place": [2.80, 0.0, 0.96],
     # The counter is 15 cm taller than the table: the torso rises before the place.
@@ -703,7 +715,7 @@ COBOT_ERRAND_MISSION = {
 def cobot_errand_spec() -> dict:
     """Two stations the twin has to drive between: the dining table and a kitchen counter.
 
-    Nothing here is within reach of the other: the table's bowl is 0.46 m from the start pose,
+    Nothing here is within reach of the other: the table's bowl is 0.46 m from the arm mounts,
     the counter's drop point is 2.8 m away and 15 cm higher, so the mission can only succeed by
     carrying the bowl across the room and raising the torso.
     """
@@ -711,7 +723,7 @@ def cobot_errand_spec() -> dict:
         "name": "cobot-errand",
         "entities": [
             {"id": "w:room", "asset": "cobot-errand-room", "at": {"x": 0.0, "y": 0.0}},
-            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": 0.0, "y": 0.0}},
+            {"id": "w:cobot-1", "asset": "cobot-magic", "at": {"x": -ARM_MOUNT_X, "y": 0.0}},
             {"id": "w:table-1", "asset": "cobot-errand-table", "at": {"x": 0.90, "y": 0.0}},
             # The bowl stands in the same reachable band as the kitchen: 0.46 m ahead, in front of
             # the left arm, fully on the tabletop.

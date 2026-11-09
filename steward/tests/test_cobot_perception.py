@@ -23,9 +23,14 @@ def rig():
 
 
 def _sync(est: EgoEstimator, sim: WorldSim) -> None:
-    """Give the estimator a clean frame: encoders from the sim, odometry at the fixed origin."""
+    """Give the estimator a clean frame: encoders from the sim, odometry the base's true pose (an
+    arm swinging round nudges the chassis by millimetres)."""
+    from steward.math3d import yaw_from_quat
+
     frame = sim.sensors("w:cobot")
-    frame["odometry"] = {"x": 0.0, "y": 0.0, "yaw": 0.0, "sigma": {"pos": 0.0, "yaw": 0.0}}
+    base = sim._entity_pose("w:cobot")
+    frame["odometry"] = {"x": base["p"][0], "y": base["p"][1], "yaw": yaw_from_quat(base["q"]),
+                         "sigma": {"pos": 0.0, "yaw": 0.0}}
     est.update(frame)
 
 
@@ -33,7 +38,7 @@ def test_every_camera_matches_the_simulation(rig) -> None:
     sim, est = rig
     _sync(est, sim)
     poses = est.camera_poses()
-    assert set(poses) == {"top_camera", "L_wrist_camera", "R_wrist_camera"}
+    assert set(poses) == {"head_camera", "wide_camera"}
     for sensor_id, pose in poses.items():
         truth, _ = sim.camera_pose("w:cobot", sensor_id)
         # 1 mm is far tighter than any perception error and absorbs the float path difference
@@ -42,26 +47,25 @@ def test_every_camera_matches_the_simulation(rig) -> None:
         assert abs(float(np.dot(pose["q"], truth["q"]))) > 0.99999, sensor_id
 
 
-def test_wrist_camera_follows_the_arm(rig) -> None:
+def test_the_head_stays_where_it_is_when_the_arms_and_the_lift_move(rig) -> None:
     sim, est = rig
     _sync(est, sim)
-    before = est.camera_pose(camera="L_wrist_camera")["p"]
-    sim.command("w:cobot", {"joints": {"L_joint1": 1.0, "L_joint2": 0.4, "L_joint5": 0.5}})
+    before = est.camera_pose(camera="head_camera")["p"]
+    sim.command("w:cobot", {"joints": {"L_joint1": 1.0, "L_joint2": 0.4, "L_joint5": 0.5, "lift": 0.9}})
     sim.step(400)
     _sync(est, sim)
-    after = est.camera_pose(camera="L_wrist_camera")["p"]
-    moved = np.linalg.norm(np.subtract(after, before))
-    assert moved > 0.15, f"the wrist camera barely moved ({moved:.3f} m)"
-    truth, _ = sim.camera_pose("w:cobot", "L_wrist_camera")
+    after = est.camera_pose(camera="head_camera")["p"]
+    assert np.linalg.norm(np.subtract(after, before)) < 1e-4, "only the chassis's own creep as the arms swing round"
+    truth, _ = sim.camera_pose("w:cobot", "head_camera")
     assert np.linalg.norm(np.subtract(after, truth["p"])) < 1e-3
 
 
 def test_pinch_point_comes_out_of_the_encoders(rig) -> None:
     sim, est = rig
-    for joints in ({"L_joint1": 0.0, "L_joint2": 1.57, "L_joint3": -1.35},
-                   {"L_joint1": -0.6, "L_joint2": 0.9, "L_joint3": -2.0}):
+    for joints in ({"L_joint1": 0.0, "L_joint2": 1.57, "L_joint3": -1.35, "L_joint4": 0.0, "L_joint5": 0.0, "L_joint6": 0.0},
+                   {"L_joint1": -0.6, "L_joint2": 0.9, "L_joint3": -2.0, "L_joint4": 0.0, "L_joint5": 0.0, "L_joint6": 0.0}):
         sim.command("w:cobot", {"joints": joints})
-        sim.step(400)
+        sim.step(1500)  # from the resting posture the arm swings a long way: let it settle
         _sync(est, sim)
         truth = sim.grasp_point("w:cobot", "L_link6")["p"]
         got = est.gripper_position("L_link6")
@@ -167,7 +171,7 @@ def test_a_dual_arm_load_follows_the_arm_that_holds_it(rig) -> None:
     # measured there, so a body that looks only between moves still carries the object by the hand.
     track.pos = np.array([0.31, 0.29, 0.78])
     est.mark_held(track.id, gripper="R_link6", at=np.array([0.30, 0.30, 0.78]))
-    assert np.linalg.norm(track.held_offset - np.array([0.01, -0.01, 0.0])) < 1e-9
+    assert np.linalg.norm(est.gripper_rotation("R_link6") @ track.held_offset - np.array([0.01, -0.01, 0.0])) < 1e-9
 
     # Opening that gripper puts the load down where it is.
     frame = frame_with_right_holding()

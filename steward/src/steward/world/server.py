@@ -25,18 +25,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import mujoco
+
 from steward.authoring.service import AuthoringError, AuthoringService
-from steward.embodiments import scenario_embodiments
+from steward.embodiments import EMBODIMENTS, embodiment_catalog, scenario_embodiments, with_body
 from steward.glrender import IMAGE_FORMATS
 from steward.net import NO_CONTENT, Binary, HttpError, JsonServer, call, fetch
 from steward.observer.observer import Observer
 from steward.world.console import CONSOLE_HTML, console_state
 from steward.phases import DEFAULT_PHASE, phase_catalog, phase_modules
+from steward.scene.extent import entity_body_ids
+from steward.scene.mjcf import build_mjcf
+from steward.scene.schema import SceneState
 from steward.world.chat import ChatConfig, HarnessChat
 from steward.viewloop import ViewLoop, ViewSettings, frame_response
 from steward.world.goals import evaluate as evaluate_goal
 from steward.world.sim import EditError, PerceptionConfig, WorldSim, speed_json
 from steward.world.sensor_cameras import SensorCameras
+from steward.world.thinking import session_files
 from steward.world.world_view import WorldViewRenderer
 
 
@@ -56,22 +62,50 @@ class _MainTask:
     error: BaseException | None = None
 
 
+def start_blocked(scenario: dict, tolerance: float = 0.01) -> list[str]:
+    """What a robot of ``scenario`` interpenetrates by more than ``tolerance`` at the start, from
+    the compiled scene's contacts: another body may be larger than the one the scene was built with."""
+    build = build_mjcf(SceneState.from_dict(scenario["sceneState"]), timestep=0.005)
+    model = build.compile()
+    data = mujoco.MjData(model)
+    build.apply_initial(model, data)
+    mujoco.mj_forward(model, data)
+    owner = {bid: eid for eid, names in build.names.items() for bid in entity_body_ids(model, names)}
+    robots, out = set(scenario["robots"]), []
+    for c in range(data.ncon):
+        con = data.contact[c]
+        e1, e2 = owner.get(int(model.geom_bodyid[con.geom1])), owner.get(int(model.geom_bodyid[con.geom2]))
+        if e1 != e2 and (e1 in robots or e2 in robots) and con.dist < -tolerance:
+            out.append(f"{e1} and {e2} interpenetrate by {-con.dist:.3f} m")
+    return sorted(set(out))
+
+
 class StewardHost:
     def __init__(self, root: Path | str, *, scenario: str | None = None, speed: float = 1.0, seed: int = 0,
                  run_dir: Path | None = None, wca_port: int = 0, robot_ports: dict[str, int] | None = None,
                  chat: ChatConfig | None = None, phase: str | None = None, fallback_phase: str = DEFAULT_PHASE,
                  bind_wait_s: float = 0.0, pause_on_perception_fault: bool = False, freeze_idle: bool = False,
-                 appearance: str = "flat", misnames: dict[str, str] | None = None):
+                 appearance: str = "flat", misnames: dict[str, str] | None = None, body: str | None = None,
+                 dispatch_task: bool = False):
         # ``phase`` pins the level for every episode; None: each scenario's declared level, or
         # ``fallback_phase`` for a scenario that declares none.
         phase_modules(phase or fallback_phase)
         # Names the ideal detections report instead of the true categories at a ``misnamed`` level.
         self.misnames = dict(misnames or {})
+        # The body every episode's robots get; None: the body each scenario was built with.
+        if body is not None and body not in EMBODIMENTS:
+            raise ValueError(f"unknown body {body!r}; registered: {', '.join(EMBODIMENTS)}")
+        self.body = body
         self._pinned_phase = phase
         self._fallback_phase = fallback_phase
         self.phase = phase or fallback_phase
         self.authoring = AuthoringService(root)
         self.chat = HarnessChat(chat, lambda: self.wca.url)
+        # Session files of reset episodes, whose thinking the console no longer shows.
+        self.stale_sessions: frozenset[str] = frozenset()
+        # On: every episode the WCA loads or resets starts the robot's Ego Harness on the scenario's
+        # task (:meth:`dispatch_scenario_task`), and a turn still running is stopped before the world changes.
+        self.dispatch_task = dispatch_task
         self.speed = speed
         self.freeze_idle = freeze_idle
         self.appearance = appearance
@@ -98,6 +132,10 @@ class StewardHost:
         # went backwards would otherwise begin a round against a scenario it is not built for.
         self.before_episode_load: Callable[[dict], None] | None = None
         self.on_episode_loaded: Callable[[], None] | None = None
+        # Called on a reset, before the world starts over: `steward up` stops every Ego Runtime
+        # process, so that :attr:`on_episode_loaded` starts each robot afresh, with nothing it believed,
+        # planned or recorded left over.
+        self.before_episode_reset: Callable[[], None] | None = None
         self.view_settings: ViewSettings | None = None
         renderer = WorldViewRenderer(lambda: self.sim)
         self.world_view = ViewLoop("world", renderer.render, renderer.close)
@@ -105,11 +143,23 @@ class StewardHost:
             self.load_episode(scenario)
 
     # --------------------------------------------------------------- episodes
-    def load_episode(self, name: str) -> dict:
+    def scenario_for(self, name: str) -> dict:
+        """Scenario ``name`` as it will load: built on first use, its robots given :attr:`body`."""
         # A builtin scenario the operator picked from the catalog is built on first use, so the
-        # console offers every body's scenes without a separate build command per root.
+        # console offers every scene without a separate build command per root.
         self.authoring.ensure_scenario(name)
         scenario = self.authoring.load_scenario(name)
+        if self.body is None or set(scenario_embodiments(scenario)[r]["id"] for r in scenario["robots"]) == {self.body}:
+            return scenario
+        bodied = with_body(scenario, self.body)
+        blocked = start_blocked(bodied)
+        if blocked:
+            raise HttpError(409, f"{EMBODIMENTS[self.body]['label']} does not fit where scenario {name!r} starts its "
+                                 f"robot: {'; '.join(blocked)}")
+        return bodied
+
+    def load_episode(self, name: str) -> dict:
+        scenario = self.scenario_for(name)
         if scenario.get("phase"):
             phase_modules(scenario["phase"])  # a scenario declares the level it was built for; unknown ones fail here
         self.phase = self._pinned_phase or scenario.get("phase") or self._fallback_phase
@@ -146,6 +196,12 @@ class StewardHost:
                 self.robot_servers[rid] = server.start()
         return {"scenario": name, "robots": {rid: self.robot_servers[rid].url for rid in scenario["robots"]},
                 "task": scenario["task"]}
+
+    def set_body(self, body: str | None) -> None:
+        """The body later episodes give their robots; None: each scenario's own."""
+        if body is not None and body not in EMBODIMENTS:
+            raise HttpError(400, f"unknown body {body!r}; registered: {', '.join(EMBODIMENTS)}")
+        self.body = body
 
     def set_phase(self, level: str) -> dict:
         """Switch the running system to a phase level (module implementations), effective with the
@@ -232,6 +288,46 @@ class StewardHost:
         """Stop relaying ``robot``'s Ego-State view (its Ego Runtime is gone or being replaced)."""
         self.ego_apis.pop(robot, None)
 
+    def dispatch_scenario_task(self) -> None:
+        """With :attr:`dispatch_task` on, start the robot's Ego Harness on the loaded scenario's task
+        in a new conversation; what keeps it from starting is reported in the chat."""
+        if not self.dispatch_task or "robot" not in self.chat.agents or self.scenario is None:
+            return
+        label = self.chat.agents["robot"].label
+        task = self.scenario["task"].strip()
+        if not task:
+            self.chat.post_note("robot", f"场景 {self.scenario['name']} 没有任务，没有下发给 {label}")
+            return
+        try:
+            self.chat.assign("robot", task)
+        except HttpError as exc:
+            self.chat.post_error("robot", f"未能把场景任务下发给 {label}：{exc}")
+
+    def _start_robot_runtimes(self) -> None:
+        """Run :attr:`on_episode_loaded` once the episode's world is up; raises ``HttpError(500)``
+        when the robots' runtimes did not start."""
+        if self.on_episode_loaded is None:
+            return
+        try:
+            self.on_episode_loaded()
+        except Exception as exc:  # noqa: BLE001 - the world is up; say what is not
+            raise HttpError(500, f"the episode is loaded but its robot runtime is not: "
+                                 f"{type(exc).__name__}: {exc}") from exc
+
+    def clear_transcripts(self) -> None:
+        """Empty the chat transcripts and the robot's thinking of the episode being reset (the
+        sessions that exist now are no longer read); its plan and activity record go with its Ego
+        Runtime process (:attr:`before_episode_reset`)."""
+        self.chat.clear()
+        home = getattr(self.chat.config, "robot_home", None)
+        if home is not None:
+            self.stale_sessions = frozenset(session_files(str(home)))
+
+    def _stop_robot_turn(self) -> None:
+        """With :attr:`dispatch_task` on, end the robot's running turn before the world it acts in changes."""
+        if self.dispatch_task and "robot" in self.chat.agents:
+            self.chat.stop_turn("robot")
+
     def start(self) -> StewardHost:
         self.wca.start()
         self.world_view.start()
@@ -266,26 +362,32 @@ class StewardHost:
         def episode(q, b):
             action = b.get("action")
             if action == "load":
+                if "body" in b:
+                    self.set_body(b["body"] or None)
+                self._stop_robot_turn()
+
                 def load() -> dict:
                     if self.before_episode_load is not None:
-                        self.authoring.ensure_scenario(b["scenario"])
-                        self.before_episode_load(self.authoring.load_scenario(b["scenario"]))
+                        self.before_episode_load(self.scenario_for(b["scenario"]))
                     result = self.load_episode(b["scenario"])
                     self.sim.start()
                     return result
                 result = self.on_main(load)
-                if self.on_episode_loaded is not None:
-                    try:
-                        self.on_episode_loaded()
-                    except Exception as exc:  # noqa: BLE001 - the world is up; say what is not
-                        raise HttpError(500, f"the episode is loaded but its robot runtime is not: "
-                                             f"{type(exc).__name__}: {exc}") from exc
+                self._start_robot_runtimes()
+                self.dispatch_scenario_task()
                 return result
             if action == "reset":
                 sim = self._require_sim()
+                if "robot" in self.chat.agents:
+                    self.chat.stop_turn("robot")
+                self.clear_transcripts()
+                if self.before_episode_reset is not None:
+                    self.before_episode_reset()
                 self.sensor_cameras.recordings.interrupt("Scene reset; start a new RGB recording")
                 self.on_main(sim.reset)
                 self.observer.reset()
+                self._start_robot_runtimes()
+                self.dispatch_scenario_task()
                 return {"reset": True}
             raise HttpError(400, "action must be load or reset")
 
@@ -368,7 +470,8 @@ class StewardHost:
             ("POST", "/scenes/render"): guard(lambda q, b: {"images": self.on_main(
                 lambda: a.render_scene_views(b["name"]))}),
             ("GET", "/scenarios"): guard(lambda q, b: {"scenarios": a.list_scenarios(),
-                                                       "catalog": a.scenario_catalog()}),
+                                                       "catalog": a.scenario_catalog(),
+                                                       "bodies": embodiment_catalog(), "body": self.body}),
             ("POST", "/scenarios/save"): guard(lambda q, b: a.save_scenario(b)),
             ("POST", "/wca/edit"): guard(lambda q, b: self.edit(b)),
             ("GET", "/wca/phase"): guard(lambda q, b: self.phase_state()),

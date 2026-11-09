@@ -33,6 +33,10 @@ class SkillFailed(Exception):
     pass
 
 
+class OutOfReach(SkillFailed):
+    """The arm cannot put its gripper where a command asks; the command was not sent."""
+
+
 @dataclass
 class MotionConfig:
     linear_speed: float = 1.4
@@ -48,6 +52,13 @@ class MotionConfig:
     gentle_turn_speed: float = 0.5
     gentle_lift_speed: float = 0.1
     """Lift and reach speed with a gentle plan: a container accelerated faster leaves its contents behind."""
+    arm_speed: float | None = None
+    """Lift and reach speed of an arm whose joints, servoed straight to a solved posture, carry the
+    grasp point off the line between the two postures (an arm driven by inverse kinematics sweeps its
+    wrist below that line, through a drawer front): the move is ramped so the grasp point stays on the
+    line. None: the joint goes straight to its target (a slide moves along the line anyway)."""
+    wrist_pitch_speed: float = 1.0
+    """Rate at which a tool tilts forward (``wrist_pitch``) on its way out to a grasp, and back after."""
     drawer_speed: float = 0.35
     """Base speed while pulling or pushing a drawer by its handle: faster, its contents tip over."""
     position_tol: float = 0.03
@@ -55,9 +66,15 @@ class MotionConfig:
     joint_tol: float = 0.01
     tick_s: float = 0.04
     retract_reach: float = 0.10
+    # After a failure the arm first rises this far, then turns the wrist upright in place, then draws
+    # back: drawn back at once, a box tipped over a table caught its edge and turned the table over.
+    failure_raise: float = 0.08
     reach_max: float = 0.70  # the wrist slide's upper joint limit; asking beyond it only fails
     stow_lift: float = 0.60
     dock_tol: float = 0.06
+    dock_position_tol: float = 0.01
+    """How near its docking pose the base settles before the arm moves (``position_tol`` leaves it
+    2-3 cm short, and the arm reaches that much farther than planned)."""
     dock_yaw_tol: float = 0.12
     align_min: float = 0.01
     align_max: float = 0.15
@@ -71,6 +88,11 @@ class MotionConfig:
     a load) gets one corrected setpoint."""
     grasp_wait_s: float = 0.1
     release_wait_s: float = 0.15
+    release_joint_tol: float = 0.002
+    """How near its setpoint each arm joint comes before a place lets go: ``joint_tol`` ends a move
+    up to a centimetre short, and the load is put down where the gripper is."""
+    release_settle_s: float = 0.6
+    """Most robot time a place waits for its joints to come within ``release_joint_tol``; then it lets go anyway."""
     handle_release_wait_s: float = 0.08
     look_dwell_s: float = 0.6
     wrist_turn_s: float = 0.6
@@ -142,6 +164,7 @@ class SkillExecutor:
         self.config = config or MotionConfig()
         self._ids = itertools.count(1)
         self._gentle = False  # the running plan moves a container with its contents
+        self._setpoints: dict[str, float] = {}  # the last target each joint was moved to
         self._look = False  # the running skill is a look-around
         self._keyframed = False  # that look-around turns at look_angular_speed only while perception keeps keyframes
         self._lock = threading.Lock()
@@ -262,10 +285,17 @@ class SkillExecutor:
             pass
 
     def _safe_retract(self) -> None:
-        try:
-            self._command({"reach": self.config.retract_reach, "wrist_roll": 0.0})
-        except Exception:  # noqa: BLE001 - best effort after a failure that is already reported
-            pass
+        """Rise ``failure_raise``, turn the wrist upright in place, then draw the arm back; each step
+        is tried even where the one before it failed."""
+        lift = self._state()["joints"].get("lift")
+        steps = [lambda: self._set_joint("lift", lift + self.config.failure_raise)] if lift is not None else []
+        steps += [lambda: self._ramp_joint("wrist_roll", 0.0, self.config.wrist_turn_s),
+                  lambda: self._set_joint("reach", self.config.retract_reach)]
+        for step in steps:
+            try:
+                step()
+            except Exception:  # noqa: BLE001 - best effort after a failure that is already reported
+                continue
 
     def _tick(self) -> dict:
         if self._stop.is_set():
@@ -304,7 +334,9 @@ class SkillExecutor:
             if st["stamp"] > deadline:
                 raise SkillFailed(f"turn did not converge (yaw error {err:.2f} rad)")
 
-    def _translate_to(self, x1: float, y1: float, yaw: float, speed: float | None = None) -> None:
+    def _translate_to(self, x1: float, y1: float, yaw: float, speed: float | None = None,
+                      tol: float | None = None) -> None:
+        tol = self.config.position_tol if tol is None else tol
         st = self._state()
         x0, y0 = st["odometry"]["x"], st["odometry"]["y"]
         # The base yaw joint is continuous: express the heading in the same unwrapped frame as the
@@ -321,7 +353,7 @@ class SkillExecutor:
             frac = self._profile(1.0 if duration == 0 else min(1.0, (st["stamp"] - t0) / duration))
             self._command({"base": [x0 + (x1 - x0) * frac, y0 + (y1 - y0) * frac, yaw]})
             err = math.hypot(x1 - st["odometry"]["x"], y1 - st["odometry"]["y"])
-            if frac >= 1.0 and err < self.config.position_tol:
+            if frac >= 1.0 and err < tol:
                 return
             if stall.stuck(st["stamp"], err):
                 raise SkillFailed(f"base is blocked: no progress for {self.config.stall_s:.0f} s ({err:.2f} m from the waypoint)")
@@ -339,16 +371,16 @@ class SkillExecutor:
             job.log.append(f"reached waypoint ({wx:.2f}, {wy:.2f})")
         self._turn_to(final_yaw)
 
-    def _set_joint(self, name: str, target: float, timeout: float = 8.0) -> None:
-        if self._gentle and name in ("lift", "reach"):
-            q0 = self._state()["joints"].get(name, target)
-            seconds = abs(target - q0) / self.config.gentle_lift_speed
+    def _set_joint(self, name: str, target: float, timeout: float = 8.0, ramp: bool = True) -> None:
+        self._setpoints[name] = target
+        speed = self.config.gentle_lift_speed if self._gentle else self.config.arm_speed
+        if ramp and speed and name in ("lift", "reach"):
+            st = self._state()
+            # An arm at rest stands outside the planar arm's workspace: its first move goes straight in.
+            q0 = target if st.get("armResting") else st["joints"].get(name, target)
+            seconds = abs(target - q0) / speed
             if seconds > self.config.tick_s:
-                self._gentle = False  # the ramp settles through this same call
-                try:
-                    self._ramp_joint(name, target, seconds)
-                finally:
-                    self._gentle = True
+                self._ramp_joint(name, target, seconds)
                 return
         self._command({name: target})
         t0 = self._state()["stamp"]
@@ -371,6 +403,18 @@ class SkillExecutor:
             if st["stamp"] - t0 > timeout:
                 raise SkillFailed(f"joint {name} did not reach {target:.3f} (at {q:.3f})")
 
+    def _settle_for_release(self) -> None:
+        """Wait until the lift and reach are within ``release_joint_tol`` of their setpoints, for at
+        most ``release_settle_s``; a joint that stays farther (sagging under the load) does not fail the place."""
+        t0 = self._state()["stamp"]
+        while True:
+            st = self._tick()
+            if all(abs(st["joints"].get(name, target) - target) < self.config.release_joint_tol
+                   for name, target in self._setpoints.items() if name in ("lift", "reach")):
+                return
+            if st["stamp"] - t0 > self.config.release_settle_s:
+                return
+
     def _profile(self, frac: float) -> float:
         """Share of a move done at time share ``frac``: steady, or for a gentle plan starting and
         ending at rest (smoothstep), so a carried container's contents are not flung."""
@@ -378,15 +422,63 @@ class SkillExecutor:
 
     def _ramp_joint(self, name: str, target: float, seconds: float) -> None:
         """Move a joint to ``target`` at a steady rate over ``seconds`` of robot time, then settle."""
+        self._ramp_joints({name: target}, seconds)
+
+    def _ramp_joints(self, targets: dict[str, float], seconds: float) -> None:
+        """Move joints to ``targets`` together over ``seconds`` of robot time, starting and ending
+        at rest, then settle each."""
         st = self._state()
-        q0, t0 = st["joints"].get(name, 0.0), st["stamp"]
+        q0, t0 = {name: st["joints"].get(name, 0.0) for name in targets}, st["stamp"]
         while True:
             st = self._tick()
             frac = min(1.0, (st["stamp"] - t0) / seconds) if seconds > 0 else 1.0
-            self._command({name: q0 + (target - q0) * frac * frac * (3.0 - 2.0 * frac)})
+            share = frac * frac * (3.0 - 2.0 * frac)
+            self._command({name: q0[name] + (target - q0[name]) * share for name, target in targets.items()})
             if frac >= 1.0:
                 break
-        self._set_joint(name, target)
+        for name, target in targets.items():
+            self._set_joint(name, target, ramp=False)
+
+    def _reach_over(self, plan: dict, xy: list[float], lift: float) -> None:
+        """Put the gripper over ``xy`` at ``lift``; with the plan's ``approachLift`` (the spot lies
+        below the rim of what holds it) the arm reaches out above the rim and goes straight down."""
+        over = plan.get("approachLift")
+        if over is not None and over > lift:
+            self._set_joint("lift", over)
+            self._reach_out(xy, plan.get("wristPitch"))
+        self._set_joint("lift", lift)
+        self._reach_out(xy, plan.get("wristPitch"))
+
+    def _reach_out(self, xy: list[float], pitch: float | None) -> None:
+        """Reach the gripper out to ``xy``, tilting the tool to ``pitch`` on the way (from where it
+        is retracted the tilted tool might not reach at all, and tilted out there it would swing
+        through what it is reaching into)."""
+        reach = max(0.05, self._reach_to(xy))
+        joints = self._state()["joints"]
+        if pitch is None or abs(joints.get("wrist_pitch", 0.0) - pitch) < self.config.joint_tol:
+            self._set_joint("reach", reach)
+            return
+        seconds = max(abs(reach - joints["reach"]) / (self.config.arm_speed or self.config.gentle_lift_speed),
+                      abs(pitch - joints.get("wrist_pitch", 0.0)) / self.config.wrist_pitch_speed)
+        self._ramp_joints({"reach": reach, "wrist_pitch": pitch}, seconds)
+
+    def _untilt(self) -> None:
+        """Turn a tool tilted forward for a grasp back to pointing down, once the arm is retracted."""
+        pitch = self._state()["joints"].get("wrist_pitch", 0.0)
+        if abs(pitch) >= self.config.joint_tol:
+            self._ramp_joints({"wrist_pitch": 0.0}, abs(pitch) / self.config.wrist_pitch_speed)
+
+    def _withdraw(self, plan: dict) -> None:
+        """Retract the arm, first back up above the rim it reached over (the plan's ``approachLift``)."""
+        over = plan.get("approachLift")
+        if over is not None and self._state()["joints"]["lift"] < over:
+            self._set_joint("lift", over)
+        self._retract(plan)
+
+    def _retract(self, plan: dict) -> None:
+        """Bring the gripper back to the retracted reach, or only as near as the plan's ``retractReach``
+        (a tool tilted forward cannot come all the way back without turning the wrist over)."""
+        self._set_joint("reach", max(self.config.retract_reach, plan.get("retractReach", 0.0)))
 
     def _wait(self, seconds: float) -> None:
         t0 = self._state()["stamp"]
@@ -395,9 +487,10 @@ class SkillExecutor:
 
     def _dock(self, job: Job, plan: dict, retract: bool = True) -> None:
         if retract:
-            self._set_joint("reach", self.config.retract_reach)
+            # Only what the arm holds is held at the plan's tilt; an empty gripper points down.
+            self._retract(plan if self._state()["gripper"].get("holding") else {})
         self._drive(job, plan["path"], plan["yaw"])
-        self._translate_to(plan["dock"][0], plan["dock"][1], plan["yaw"])
+        self._translate_to(plan["dock"][0], plan["dock"][1], plan["yaw"], tol=self.config.dock_position_tol)
         o = self._state()["odometry"]
         dist = math.hypot(o["x"] - plan["dock"][0], o["y"] - plan["dock"][1])
         dyaw = abs(wrap_angle(o["yaw"] - plan["yaw"]))
@@ -407,17 +500,20 @@ class SkillExecutor:
         job.log.append("docked")
 
     def _gripper_xy(self) -> np.ndarray:
-        """Gripper position from the robot's own odometry and reach encoder."""
+        """Gripper position from the robot's own odometry and reach encoder, on the arm's line
+        (``armLateral`` left of the base centre)."""
         st = self._state()
         o = st["odometry"]
-        ahead = st["toolOffset"] + st["joints"]["reach"]
-        return np.array([o["x"] + ahead * math.cos(o["yaw"]), o["y"] + ahead * math.sin(o["yaw"])])
+        ahead, side = st["toolOffset"] + st["joints"]["reach"], st.get("armLateral", 0.0)
+        c, s = math.cos(o["yaw"]), math.sin(o["yaw"])
+        return np.array([o["x"] + ahead * c - side * s, o["y"] + ahead * s + side * c])
 
     def _align_lateral(self, target_xy: list[float]) -> None:
         """Shift the base sideways so the target lies on the arm's line of reach."""
-        o = self._state()["odometry"]
+        st = self._state()
+        o = st["odometry"]
         left = np.array([-math.sin(o["yaw"]), math.cos(o["yaw"])])
-        lateral = float((np.array(target_xy) - np.array([o["x"], o["y"]])) @ left)
+        lateral = float((np.array(target_xy) - np.array([o["x"], o["y"]])) @ left) - st.get("armLateral", 0.0)
         if self.config.align_min < abs(lateral) <= self.config.align_max:
             self._translate_to(o["x"] + lateral * left[0], o["y"] + lateral * left[1], o["yaw"])
 
@@ -437,9 +533,11 @@ class SkillExecutor:
         return min(self.config.reach_max, float(rel @ heading) - st["toolOffset"])
 
     def _over_support(self, plan: dict) -> bool:
-        """True when the held object's footprint at the gripper lies within the support top."""
+        """True when the held object's footprint lies within the support top: the object's centre is
+        where the gripper is, offset as the plan's ``spot`` is from its ``gripSpot``."""
         box = plan["supportBox"]
-        g = self._gripper_xy()
+        grip = plan.get("gripSpot", plan["spot"])
+        g = self._gripper_xy() + np.array([plan["spot"][0] - grip[0], plan["spot"][1] - grip[1]])
         dx, dy = g[0] - box["cx"], g[1] - box["cy"]
         c, s = math.cos(-box["yaw"]), math.sin(-box["yaw"])
         lx, ly = c * dx - s * dy, s * dx + c * dy
@@ -463,13 +561,22 @@ class SkillExecutor:
             target = {"p": list(plan["targetP"])}
         if target is None:
             raise SkillFailed(f"target {plan['target']} is no longer in the ego state")
+        # A large object may be taken by its edge (``graspOffset`` from its centre, in the world), a
+        # container on its rim (``graspDz`` above its centre).
+        ox, oy = plan.get("graspOffset") or (0.0, 0.0)
+        dz = plan.get("graspDz", 0.0)
+
+        def aimed(entity: dict) -> dict:
+            return {"p": [entity["p"][0] + ox, entity["p"][1] + oy, entity["p"][2] + dz]}
+
+        target = aimed(target)
         self._align_lateral(target["p"][:2])
         # Off the floor the planned height (its base at floor level) outranks the noisy live estimate.
-        self._set_joint("lift", plan["lift"] if plan.get("support") == "floor" else target["p"][2])
-        self._set_joint("reach", max(0.05, self._reach_to(target["p"][:2])))
+        self._reach_over(plan, target["p"][:2], plan["lift"] if plan.get("support") == "floor" else target["p"][2])
         miss = float(np.linalg.norm(self._gripper_xy() - np.array(target["p"][:2])))
         if miss > plan.get("captureRadius", 0.05):
-            self._set_joint("reach", self.config.retract_reach)
+            self._withdraw(plan)
+            self._untilt()
             self._backoff(plan)
             raise SkillFailed(f"gripper is {miss * 100:.0f} cm from {plan['target']}; not closing")
         # A real object's estimate is a few centimetres off in any direction as often as not, and
@@ -477,21 +584,31 @@ class SkillExecutor:
         # feels for a cup in the dark: at the estimate, then a little forward and back (the arm
         # alone moves), then to either side (the base shifts), then at other heights. The estimate
         # is re-read before each probe -- it is best while the camera is right over the object.
+        # Taken by its edge (docked facing that side), forward lies over what is inside it and back
+        # over nothing: the probes keep along the edge.
         probes = [(0.0, 0.0, 0.0)]
-        probes += [(dx, 0.0, 0.0) for dx in self.config.grasp_probe_xy]
+        if not (ox or oy):
+            probes += [(dx, 0.0, 0.0) for dx in self.config.grasp_probe_xy]
         probes += [(0.0, dy, 0.0) for dy in self.config.grasp_probe_xy]
         probes += [(0.0, 0.0, dz) for dz in self.config.grasp_probe_z]
         grasped = False
         for n, (forward, sideways, dz) in enumerate(probes):
-            latest = self._state()["entities"].get(plan["target"]) or target
+            seen = self._state()["entities"].get(plan["target"])
+            latest = aimed(seen) if seen is not None else target
             o = self._state()["odometry"]
             heading = np.array([math.cos(o["yaw"]), math.sin(o["yaw"])])
             left = np.array([-heading[1], heading[0]])
             goal = np.array(latest["p"][:2]) + forward * heading + sideways * left
             if n:
+                self._command({"gripper": "open"})
+                self._wait(self.config.grasp_wait_s)
                 self._align_lateral(goal.tolist())
-                self._set_joint("lift", latest["p"][2] + dz)
-                self._set_joint("reach", max(0.05, self._reach_to(goal.tolist())))
+                try:
+                    self._set_joint("lift", latest["p"][2] + dz)
+                    self._set_joint("reach", max(0.05, self._reach_to(goal.tolist())))
+                except OutOfReach as e:
+                    job.log.append(f"skipped probe {n}: {e}")
+                    continue
             self._command({"gripper": "close"})
             self._wait(self.config.grasp_wait_s)
             if self._state()["gripper"]["holding"]:
@@ -505,7 +622,8 @@ class SkillExecutor:
             self._command({"gripper": "open"})
             self._wait(0.2)
         if not grasped:
-            self._set_joint("reach", self.config.retract_reach)
+            self._withdraw(plan)
+            self._untilt()
             self._backoff(plan)
             raise SkillFailed(f"grasp missed {plan['target']} ({len(probes)} probes)")
         try:
@@ -516,7 +634,7 @@ class SkillExecutor:
         self._set_joint("lift", plan["carryLift"])
         if not plan.get("keepReach"):
             # A large object carried low (a chair off the floor) keeps the arm out so it clears the base.
-            self._set_joint("reach", self.config.retract_reach)
+            self._retract(plan)
         if "retreat" in plan:
             self._translate_to(plan["retreat"][0], plan["retreat"][1], plan["yaw"])
         else:
@@ -527,20 +645,33 @@ class SkillExecutor:
         self._dock(job, plan)
         if "wristYaw" in plan:
             self._ramp_joint("wrist_yaw", plan["wristYaw"], self.config.wrist_turn_s)
-        if "wristRoll" in plan:
+        grip = plan.get("gripSpot", plan["spot"])
+        if "turnLift" in plan:
+            # Turned over in the air above the spot, then lowered as far as the arm reaches so.
+            self._align_lateral(grip)
+            self._set_joint("lift", plan["turnLift"])
+            self._reach_out(grip, plan.get("wristPitch"))
+            self._command({"wrist_roll": plan["wristRoll"], "turnOver": True})
+            self._set_joint("wrist_roll", plan["wristRoll"], ramp=False)
+        elif "wristRoll" in plan:
             self._ramp_joint("wrist_roll", plan["wristRoll"], self.config.wrist_turn_s)
-        self._align_lateral(plan["spot"])
-        self._set_joint("lift", plan["lift"])
-        self._set_joint("reach", max(0.05, self._reach_to(plan["spot"])))
+        self._align_lateral(grip)
+        self._reach_over(plan, grip, plan["lift"])
         if not self._over_support(plan):
-            self._set_joint("reach", self.config.retract_reach)
+            self._withdraw(plan)
             self._backoff(plan)
             raise SkillFailed(f"gripper is not over {plan['support']}; keeping {plan['object']}")
+        self._settle_for_release()
         self._command({"gripper": "open"})
         self._released(plan["object"], plan["spot"])
         self._wait(self.config.release_wait_s)
         job.log.append(f"released {plan['object']} on {plan['support']}")
-        self._set_joint("reach", self.config.retract_reach)
+        if "turnLift" in plan:
+            self._set_joint("lift", plan["turnLift"])
+            self._command({"wrist_roll": 0.0, "turnOver": True})
+            self._set_joint("wrist_roll", 0.0, ramp=False)
+        self._withdraw(plan)
+        self._untilt()
         self._set_joint("lift", max(plan["lift"], self.config.stow_lift))
         if "wristYaw" in plan:
             self._set_joint("wrist_yaw", 0.0)
@@ -551,16 +682,19 @@ class SkillExecutor:
 
     def _pour(self, job: Job, plan: dict) -> None:
         """Hold the container low over the spot, tip it slowly about the arm, wait for the contents
-        to fall out, set it upright again and back away still holding it."""
+        to fall out, raise it ``rise`` off the pile, set it upright again and back away still holding it."""
         self._dock(job, plan)
-        self._align_lateral(plan["spot"])
+        grip = plan.get("gripSpot", plan["spot"])
+        self._align_lateral(grip)
         self._set_joint("lift", plan["lift"])
-        self._set_joint("reach", max(0.05, self._reach_to(plan["spot"])))
+        self._set_joint("reach", max(0.05, self._reach_to(grip)))
         self._tip(plan["lift"], plan["pivot"], 0.0, plan["roll"])
         self._wait(plan["pourS"])
         job.log.append(f"poured {plan['object']} over {plan['support']}")
-        self._tip(plan["lift"], plan["pivot"], plan["roll"], 0.0)
-        self._set_joint("reach", self.config.retract_reach)
+        raised = plan["lift"] + plan["rise"]
+        self._set_joint("lift", raised + plan["pivot"] * abs(math.sin(plan["roll"])))
+        self._tip(raised, plan["pivot"], plan["roll"], 0.0)
+        self._retract(plan)
         self._set_joint("lift", max(plan["lift"], self.config.stow_lift))
         self._backoff(plan)
         job.message = f"poured {plan['object']} over {plan['support']}"

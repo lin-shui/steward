@@ -44,7 +44,9 @@ ROBOT_BRIEF = (
     "按物体的 role 理解操作员说的「餐边柜」「柜子」「咖啡杯」等指称：role 是结合整个场景推断出的用途标签，"
     "category 只是单个视角下最像的类别，局部视角下家具和相似餐具容易混淆。"
     "每个动作先用 ego_predict 得到收据，风险超限就先靠近观察再预测，然后用 skill_run 执行；"
-    "执行后用 ego_state 自查结果。完成或无法完成时，用一两句中文向操作员汇报。\n"
+    "执行后用 ego_state 自查结果。宣布完成之前，如果任务要求结果和某个参照图或参照物一致（例如按盒盖图案拼图），"
+    "必须用独立证据核对最终状态：把摆好的排列合成图或逐块 ego_match_face 得分与参照比较，相关系数要明显高于随机排列，"
+    "达不到就继续修正或调用 reflect，不要只数格位是否占满、正反面是否朝上。完成或无法完成时，用一两句中文向操作员汇报。\n"
     "新视角生成通过 rgbd-video-gen 或 novelanything skill 及其工具调用；明确指定模型时不得替换。"
     "模型输入输出保存在机器人工作空间 inputs/outputs；使用工具返回的真实路径和 local_manifest_path，勿猜文件名。"
     "运动过程取证先用 ego_rgb_recording_start 按要求fps录制 head_camera RGB，运动结束后用 ego_rgb_recording_stop；"
@@ -59,14 +61,25 @@ ROBOT_BRIEF = (
     "感知给物体起的名字不一定是操作员的叫法：分割网络按外观命名（印着图案的盒子可能叫 picture），分类器只认识它有形状先验的类别。"
     "找不到指令里的物体、或一步失败时，先对照指令里的描述（大小、颜色、位置、和其他物体的关系）想一想是不是认错了物体，"
     "用 ego_candidates 传入指令里的名字和大小找出可能的对象，核实后用 ego_annotate 改正。"
+    "感知也可能留下根本不存在的物体：ego_state 里标着 unsupported 的物体悬在空中、下面没有任何东西托着，或者嵌在别的物体里，"
+    "这在物理上不可能。遇到这种物体，先别拿它做计划，走到能看清它所在位置的地方，用 ego_observe 再看几次（必要时换个角度）；"
+    "重新看到了，就以新的观测为准；它所在的位置已经清楚可见、却一直感知不到（lastSeenAgoS 一直在增长），"
+    "就用 ego_forget 把它从 Ego State 删除，reason 里写明它为什么不合理、你是怎样复查的。\n"
     "机器人工具或程序失败后，你会收到一条【反思】消息，里面有原始指令、之前的失败、失败归类和相关物体的证据；"
     "同类失败再次出现或多次反思仍受阻时，收到的是【深度反思】，还附有场景摘要；连续多个程序没有反思时，会收到【阶段回顾】。"
-    "【反思】和【阶段回顾】用几句话逐条回答；【深度反思】先在思考中充分推敲（先宏观：任务、场景和指令的措辞；再微观：物理原因；"
+    "【反思】和【阶段回顾】逐条回答，每条一句话；【深度反思】先在思考中充分推敲（先宏观：任务、场景和指令的措辞；再微观：物理原因；"
     "最后是方法和效率），再分层逐条作答。回答完再决定下一步。没有工具报错、但结果和目标不符或一直没有进展时，"
     "在程序里调用 reflect 描述困难并打印返回的问题；认为做不到、或想改用低于指令要求的做法（例如不按图案对位）之前，"
     "也先调用 reflect 深度反思，核实这个结论的依据没有被你自己的动作改变（例如参照物被压住或翻面）。\n"
     "先想清楚为什么不可行：预测结果的 blockers 列出挡路的物体；如果是可搬动的（movable，例如椅子），"
     "先把它搬到 parkAt 给出的不碍事位置，再重新预测原来的动作；不可搬动的障碍才需要换做法或报告。\n"
+    "放下任何东西之前（放置、暂放、倾倒、放回腾空的容器、搬开挡路的物体），先想它对后面的动作有什么影响："
+    "列出剩下的步骤各要用哪块台面或地面、要多大地方（主要的工作区、倒出的东西摊开的范围、之后还要放下的容器和盖子），"
+    "按 ego_state 里的尺寸和位置先给它们分好地方，再决定这一次放在哪里。暂时不用的东西靠边、靠角、彼此挨紧，占地越少越好，"
+    "把最大的一块连续空白留给主要工作；倾倒时让倒出的范围偏向一侧，给之后要放下的容器留出位置。"
+    "台面确实放不下时可以放到地面：放在墙角或贴墙，避开家具前面的停靠位和机器人要走的路线（预测给出的 parkAt 就是这样的位置）。"
+    "放下后用 ego_state 核实剩下的地方还够后面的步骤用；不够就先挪开刚放的东西，不要把后面的东西硬塞进去。"
+    "这条对任何任务都适用：选位置时既看这一步能不能做成，也看会不会妨碍之后的动作。\n"
     "工具都在 run_code 程序里调用。每个程序结束后你都要停下来思考，这段时间机器人原地不动，思考越多任务越慢，所以：\n"
     "一个程序完成一整段工作：用循环处理一组物体（例如逐个拿起、检查、放好），每一轮从 ego_state 或上一步的结果里取得这一轮的参数"
     "（下一个物体、目标位置、备选的做法），每一步检查预测和技能结果；程序能判断的情况（换备选位置、跳过已完成的物体、重试一次）"
@@ -81,7 +94,14 @@ ROBOT_BRIEF = (
     "有合适的 recipe 就直接用 capability_get 取出来运行（code 是以 tools 和 args 为参数的 async 函数体："
     "var AsyncFunction = (async () => {}).constructor; var run = new AsyncFunction('tools', 'args', cap.code); "
     "await run(tools, {...})，不要重写它）；没有就自己写程序，把 ego_inspect（看清物体顶面）、"
-    "ego_match_face（找出物体的图案在参考图上的位置和转向；机器人会记住看到过的物体顶面，先走到能看清所有物体的地方，再一次传入全部物体比对）、ego_annotate（标注你认出的物体类别与可供性）"
+    "ego_match_face（找出物体的图案在参考图上的位置和转向；机器人会记住看到过的物体顶面，先走到能看清所有物体的地方，再一次传入全部物体比对；小物体的图案要走近才看得清："
+    "ego_inspect 结果的 sourcePx 是顶面在相机图像里的像素宽，带 detailHint 时说明还不够清楚并给出要走到多近，"
+    "先按提示走近再看、再比对，不要用看不清的图案硬配；图案比对用 ego_match_face 时把 px 提到 24–32（上限 32），"
+    "让相机分辨率真正用到匹配上；卡片、拼图块、照片这类扁平物体可能背面朝上，背面通常是均匀的单一颜色，"
+    "判断正反面用 ego_inspect 的 plain（true）或 interiorColors（约 20 以下即背面硬纸板）；"
+    "不要用 spread / interiorSpread——桌面光照会让单色背面的 RGB 标准差达到 25–35，看起来像有图案；"
+    "拼图块挨着时边缘格还会混进邻块颜色；"
+    "判断前先把互相压着的摊开、再走近看清，判定背面朝上的用 place 的 flip 翻过来再比对）、ego_annotate（标注你认出的物体类别与可供性）"
     "和 ego_predict / skill_run 组合起来，并尽量复用已有的 skill。做成之后用 capability_save 保存："
     "把每个能用在别的物体上的操作存成 skill（例如把一堆物体摊开、把扁平物体翻成正面、按网格摆放），"
     "再存一个只负责组合这些 skill 的 recipe；物体 id、位置和尺寸都放进参数，做不到预期结果时让代码抛出错误。"
@@ -89,6 +109,42 @@ ROBOT_BRIEF = (
 )
 
 ROBOT_OWNER = "operator"
+TURN_BUDGET_S = 24 * 24 * 3600.0
+
+
+def capabilities_digest(home: Path | None, *, max_description: int = 120) -> str:
+    """A short list of saved capabilities to prepend to the first robot turn, so the model sees
+    what it can reuse without calling ``capability_list`` first.
+
+    :param home: the robot's DSH home (``DSH_HOME``); ``None`` or a missing library yields "".
+    :param max_description: longest description kept per capability.
+    :returns: a Chinese paragraph ending with a blank line, or "" when there is nothing to list."""
+    if home is None:
+        return ""
+    root = home / "steward-capabilities"
+    if not root.is_dir():
+        return ""
+    lines: list[str] = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        name = record.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        layer = record.get("layer", "?")
+        status = record.get("status", "?")
+        description = record.get("description", "")
+        if not isinstance(description, str):
+            description = ""
+        if len(description) > max_description:
+            description = description[: max_description - 1] + "…"
+        lines.append(f"- {name}（{layer}，{status}）：{description}")
+    if not lines:
+        return ""
+    return ("你已保存的能力（本轮开始时的清单；有合适的先用 capability_get 取出来运行，不要重写）：\n"
+            + "\n".join(lines) + "\n\n")
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -126,7 +182,8 @@ class ChatConfig:
     world_home: Path | None = None
     robot_home: Path | None = None
     ego_api: str | None = None
-    timeout_s: float = 900.0
+    timeout_s: float = TURN_BUDGET_S  # wall seconds a turn may run before it is ended
+    stop_wait_s: float = 15.0  # how long a stopped turn may take to end before a new task gives up on it
 
 
 @dataclass
@@ -147,6 +204,12 @@ class _Agent:
     busy: bool = False
     proc: subprocess.Popen | None = None
     cancelled: bool = False
+    # What the harness is waiting on during a busy turn: ``llm`` while the model answers,
+    # ``run_code`` / ``tool`` while a tool call is open. Cleared when the turn ends.
+    wait_kind: str | None = None
+    wait_since: float | None = None
+    wait_tool: str | None = None
+    wait_detail: str | None = None
 
 
 @dataclass
@@ -212,7 +275,8 @@ class HarnessChat:
                      "plan": self._robot_plan(activity_since)}
         with self._lock:
             agents = {key: {"label": a.label, "available": self.unavailable_reason(key) is None,
-                            "reason": self.unavailable_reason(key), "busy": a.busy, "sessionId": a.session_id}
+                            "reason": self.unavailable_reason(key), "busy": a.busy, "sessionId": a.session_id,
+                            "wait": self._wait_of(a)}
                       for key, a in self.agents.items()}
             messages = [e.to_dict() for e in self._entries if e.id > since]
         if robot:
@@ -233,6 +297,7 @@ class HarnessChat:
             if agent.busy:
                 raise HttpError(409, f"{agent.label} is still working on the previous message")
             agent.busy = True
+            self._set_wait(agent, "llm")
             entry = self._add(key, "user", text)
             first = agent.session_id is None
         threading.Thread(target=self._run, args=(agent, text, first), name=f"chat-{key}", daemon=True).start()
@@ -248,6 +313,15 @@ class HarnessChat:
             agent.session_id = None
             self._add(key, "system", f"已开始新的 {agent.label} 会话")
         return {"reset": True}
+
+    def clear(self) -> None:
+        """Empty the transcript of every harness and start each idle one on a new conversation (an
+        episode reset). A harness still running keeps its conversation for the rest of its turn."""
+        with self._lock:
+            self._entries.clear()
+            for agent in self.agents.values():
+                if not agent.busy:
+                    agent.session_id = None
 
     def cancel(self, key: str) -> dict:
         """Stop the running turn of one harness; robot control is released when the turn ends."""
@@ -267,6 +341,33 @@ class HarnessChat:
             except (HttpError, OSError) as exc:
                 self._report(agent, f"停止机器人动作失败：{exc}")
         return {"stopped": True}
+
+    def stop_turn(self, key: str) -> None:
+        """Stop the running turn of ``key``, if any, and return once it has ended; raises
+        ``HttpError(504)`` when it is still running after ``stop_wait_s``."""
+        agent = self.agents.get(key)
+        if agent is None:
+            raise HttpError(400, f"unknown chat target {key!r}")
+        deadline = time.monotonic() + self.config.stop_wait_s
+        stopped = None
+        while agent.busy:
+            proc = agent.proc
+            if proc is not None and proc is not stopped:
+                self.cancel(key)
+                stopped = proc
+            if time.monotonic() > deadline:
+                raise HttpError(504, f"{agent.label} did not end its running turn within {self.config.stop_wait_s:g} s")
+            time.sleep(0.05)
+
+    def assign(self, key: str, text: str) -> dict:
+        """Give ``key`` the task ``text`` in a new conversation, its running turn stopped first.
+
+        Returns:
+            What :meth:`send` returns for the task message.
+        """
+        self.stop_turn(key)
+        self.reset(key)
+        return self.send(key, text)
 
     def stop(self) -> None:
         for agent in self.agents.values():
@@ -336,6 +437,12 @@ class HarnessChat:
         with self._lock:
             self._add(agent, "error", text)
 
+    def post_note(self, agent: str, text: str) -> None:
+        """Add a system line to the transcript under ``agent``: something the operator should know
+        that is not a fault."""
+        with self._lock:
+            self._add(agent, "system", text)
+
     def _report(self, agent: _Agent, text: str) -> None:
         with self._lock:
             self._add(agent.key, "error", text)
@@ -362,7 +469,11 @@ class HarnessChat:
                                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                                  encoding="utf-8", errors="replace",  # dsh speaks UTF-8; the Windows
                                                  start_new_session=True)  # locale (GBK) would kill the reader
-            proc.stdin.write((agent.brief if first else agent.follow_up) + text)
+            prefix = agent.brief if first else agent.follow_up
+            if first and agent.key == "robot":
+                # Reflection quotes the text after the last follow_up marker as the instruction.
+                prefix = prefix.removesuffix(agent.follow_up) + capabilities_digest(agent.home) + agent.follow_up
+            proc.stdin.write(prefix + text)
             proc.stdin.close()
             err_reader = threading.Thread(target=lambda: stderr_tail.extend(proc.stderr), daemon=True)
             err_reader.start()
@@ -405,6 +516,43 @@ class HarnessChat:
             with self._lock:
                 agent.busy = False
                 agent.proc = None
+                self._clear_wait(agent)
+
+    def _wait_of(self, agent: _Agent) -> dict | None:
+        """Live wait state for the console progress bar, or ``None`` when the agent is idle."""
+        if not agent.busy or agent.wait_kind is None or agent.wait_since is None:
+            return None
+        out: dict = {"kind": agent.wait_kind, "since": agent.wait_since}
+        if agent.wait_tool:
+            out["tool"] = agent.wait_tool
+        if agent.wait_detail:
+            out["detail"] = agent.wait_detail
+        return out
+
+    @staticmethod
+    def _set_wait(agent: _Agent, kind: str, tool: str | None = None, detail: str | None = None) -> None:
+        agent.wait_kind = kind
+        agent.wait_since = time.time()
+        agent.wait_tool = tool
+        agent.wait_detail = detail
+
+    @staticmethod
+    def _clear_wait(agent: _Agent) -> None:
+        agent.wait_kind = None
+        agent.wait_since = None
+        agent.wait_tool = None
+        agent.wait_detail = None
+
+    @staticmethod
+    def _tool_wait_detail(inp: object) -> str | None:
+        """A short label for an open tool call, taken from its common description fields."""
+        if not isinstance(inp, dict):
+            return None
+        for key in ("description", "goal", "summary", "title"):
+            value = inp.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:80]
+        return None
 
     def _ingest(self, agent: _Agent, line: str, last_text: str | None) -> str | None:
         try:
@@ -419,14 +567,18 @@ class HarnessChat:
                 last_text = event["text"].strip()
                 self._add(agent.key, "assistant", last_text)
             elif kind == "tool_call":
-                self._add(agent.key, "tool", "", tool=event.get("tool"), input=event.get("input"), status="running",
+                tool = event.get("tool")
+                self._add(agent.key, "tool", "", tool=tool, input=event.get("input"), status="running",
                           call_id=event.get("callId"))
+                wait_kind = "run_code" if tool == "run_code" else "tool"
+                self._set_wait(agent, wait_kind, tool=tool, detail=self._tool_wait_detail(event.get("input")))
             elif kind == "tool_result":
                 for entry in reversed(self._entries):
                     if entry.role == "tool" and entry.call_id == event.get("callId"):
                         entry.status = event.get("status")
                         entry.text = str(event.get("result", ""))[:1200]
                         break
+                self._set_wait(agent, "llm")
             elif kind == "final":
                 agent.session_id = event.get("sessionId") or agent.session_id
                 final = (event.get("text") or "").strip()

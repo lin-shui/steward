@@ -13,7 +13,7 @@ import pytest
 from steward.assets.generators import steward_bot
 from steward.ego.runtime import EgoRuntime, RobotLink
 from steward.net import JsonServer
-from steward.world.chat import ChatConfig, HarnessChat
+from steward.world.chat import ChatConfig, HarnessChat, ROBOT_BRIEF, capabilities_digest
 from steward.world.server import StewardHost
 
 EVENTS = [
@@ -110,6 +110,12 @@ def test_world_chat_keeps_its_session_and_targets_this_hosts_wca(tmp_path):
 
 def test_robot_chat_takes_control_for_the_turn_and_gives_it_back(tmp_path):
     robot = _home(tmp_path, "robot-1", "ego")
+    library = robot / "steward-capabilities"
+    library.mkdir()
+    (library / "flip_flat_objects_face_up.json").write_text(json.dumps({
+        "name": "flip_flat_objects_face_up", "layer": "skill", "status": "verified",
+        "description": "Inspects flat objects and flips face-down ones picture side up.",
+    }), encoding="utf-8")
     calls = []
 
     def control(q, b):
@@ -132,6 +138,10 @@ def test_robot_chat_takes_control_for_the_turn_and_gives_it_back(tmp_path):
     assert cwd.parts[-2:] == ("robot-1", "workspace"), "the robot runs in its empty workspace"
     stdin = (robot / "stdin").read_text(encoding="utf-8")
     assert stdin.startswith("你是家用服务机器人") and "World State" not in stdin
+    assert "flip_flat_objects_face_up（skill，verified）" in stdin
+    assert stdin.endswith("\n\n操作员任务：把杯子放到餐桌上"), "the capability list precedes the instruction marker"
+    assert "interiorSpread" in ROBOT_BRIEF and "相关系数" in ROBOT_BRIEF
+    assert capabilities_digest(None) == "" and capabilities_digest(tmp_path / "empty") == ""
     assert [m["agent"] for m in chat.state()["messages"]] == ["robot"] * 3
 
 
@@ -163,6 +173,140 @@ def test_stopping_a_robot_turn_ends_the_run_and_releases_control(tmp_path):
     roles = [m["role"] for m in chat.state()["messages"]]
     assert "system" in roles and "error" not in roles
     assert chat.cancel("robot") == {"stopped": False}
+
+
+def test_robot_wait_reports_llm_then_run_code_then_llm_again(tmp_path):
+    """The console progress bar needs a live wait kind while the turn is busy."""
+    robot = _home(tmp_path, "robot-1", "ego")
+    gate = tmp_path / "gate"
+    script = _launcher(tmp_path, (
+        "import json\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'type': 'session', 'sessionId': 's-1'}), flush=True)\n"
+        "time.sleep(0.15)\n"
+        "print(json.dumps({'type': 'tool_call', 'callId': 'c1', 'tool': 'run_code',"
+        " 'input': {'description': 'inspect pieces'}}), flush=True)\n"
+        f"open({str(gate)!r}, 'w').write('run')\n"
+        "time.sleep(0.2)\n"
+        "print(json.dumps({'type': 'tool_result', 'callId': 'c1', 'status': 'completed',"
+        " 'result': 'ok'}), flush=True)\n"
+        "time.sleep(0.15)\n"
+        "print(json.dumps({'type': 'final', 'sessionId': 's-1', 'text': 'done'}), flush=True)\n"))
+    ego = JsonServer({("POST", "/ego/control"): lambda q, b: {"owner": None},
+                      ("GET", "/ego/control"): lambda q, b: {"owner": None}}).start()
+    try:
+        chat = HarnessChat(ChatConfig(dsh=script, cwd=tmp_path, env_file=tmp_path / ".env",
+                                      robot_home=robot, ego_api=ego.url), lambda: "unused")
+        chat.send("robot", "看一眼桌面")
+        wait = chat.state()["agents"]["robot"]["wait"]
+        assert wait and wait["kind"] == "llm" and isinstance(wait["since"], float)
+        deadline = time.time() + 5
+        while not gate.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        assert gate.exists()
+        wait = chat.state()["agents"]["robot"]["wait"]
+        assert wait["kind"] == "run_code" and wait["tool"] == "run_code" and wait["detail"] == "inspect pieces"
+        while (chat.state()["agents"]["robot"].get("wait") or {}).get("kind") != "llm" and time.time() < deadline:
+            time.sleep(0.02)
+        assert chat.state()["agents"]["robot"]["wait"]["kind"] == "llm"
+        _wait_idle(chat, "robot")
+    finally:
+        ego.stop()
+    assert chat.state()["agents"]["robot"]["wait"] is None
+
+
+def _recording_dsh(tmp_path):
+    """A stand-in launcher that records each turn (resumed or not, its stdin), prints a session and,
+    for a task marked ⏳, keeps running until stopped."""
+    return _launcher(tmp_path, (
+        "import json\n"
+        "args = sys.argv[1:]\n"
+        "text = sys.stdin.buffer.read().decode('utf-8')\n"
+        "with open(os.path.join(os.environ['DSH_HOME'], 'turns'), 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps({'resumed': '--session-id' in args, 'text': text}) + '\\n')\n"
+        "print(json.dumps({'type': 'session', 'sessionId': 's-1'}), flush=True)\n"
+        "if text.endswith('⏳'):\n"
+        "    time.sleep(30)\n"))
+
+
+def _turns(home: Path) -> list[dict]:
+    return [json.loads(line) for line in (home / "turns").read_text(encoding="utf-8").splitlines()]
+
+
+def _robot_ego(calls: list) -> JsonServer:
+    return JsonServer({("POST", "/ego/control"): lambda q, b: calls.append(b["action"]) or {"owner": None},
+                       ("GET", "/ego/control"): lambda q, b: {"owner": None},
+                       ("POST", "/skill/stop"): lambda q, b: calls.append("stop") or {"stopped": None}}).start()
+
+
+def test_a_task_given_anew_stops_the_running_turn_and_starts_a_new_conversation(tmp_path):
+    robot = _home(tmp_path, "robot-1", "ego")
+    calls = []
+    ego = _robot_ego(calls)
+    try:
+        chat = HarnessChat(ChatConfig(dsh=_recording_dsh(tmp_path), cwd=tmp_path, env_file=tmp_path / ".env",
+                                      robot_home=robot, ego_api=ego.url), lambda: "unused")
+        chat.send("robot", "收拾餐桌⏳")
+        deadline = time.time() + 5
+        while chat.agents["robot"].session_id is None and time.time() < deadline:
+            time.sleep(0.02)
+        chat.assign("robot", "把拼图拼好")
+        _wait_idle(chat, "robot")
+    finally:
+        ego.stop()
+    turns = _turns(robot)
+    assert [t["resumed"] for t in turns] == [False, False], "the new task opens a new conversation"
+    assert turns[1]["text"].startswith("你是家用服务机器人") and turns[1]["text"].endswith("把拼图拼好")
+    assert calls == ["acquire", "stop", "release", "acquire", "release"]
+
+
+def test_the_host_gives_the_scenario_task_to_the_robot_whenever_an_episode_loads_or_resets(kitchen_root, tmp_path):
+    import threading
+
+    from steward.net import call
+
+    robot = _home(tmp_path, "robot-1", "ego")
+    calls = []
+    ego = _robot_ego(calls)
+
+    def over_wca(host: StewardHost, body: dict) -> dict:
+        out: dict = {}
+        worker = threading.Thread(target=lambda: out.update(call("POST", f"{host.wca.url}/wca/episode", body)))
+        worker.start()
+        while worker.is_alive():
+            host.pump(0.05)
+        _wait_idle(host.chat, "robot")
+        return out
+
+    def host(dispatch: bool) -> StewardHost:
+        config = ChatConfig(dsh=_recording_dsh(tmp_path), cwd=tmp_path, env_file=tmp_path / ".env",
+                            robot_home=robot, ego_api=ego.url)
+        return StewardHost(kitchen_root, scenario="phase0-kitchen", run_dir=tmp_path, chat=config,
+                           dispatch_task=dispatch).start()
+
+    try:
+        quiet = host(False)
+        try:
+            over_wca(quiet, {"action": "load", "scenario": "phase0-kitchen"})
+        finally:
+            quiet.stop()
+        assert not (robot / "turns").exists(), "without dispatch_task the robot waits for the operator"
+        steward = host(True)
+        try:
+            task = steward.scenario["task"]
+            over_wca(steward, {"action": "load", "scenario": "phase0-kitchen"})
+            before = [m["text"] for m in steward.chat.state()["messages"]]
+            over_wca(steward, {"action": "reset"})
+            after = [m["text"] for m in steward.chat.state()["messages"]]
+        finally:
+            steward.stop()
+    finally:
+        ego.stop()
+    turns = _turns(robot)
+    assert [t["resumed"] for t in turns] == [False, False], "each episode starts a new conversation"
+    assert all(t["text"].endswith(task) for t in turns)
+    assert calls == ["acquire", "release"] * 2
+    assert after.count(task) == 1 and len(after) < len(before) + 2, "a reset empties the transcript before the new task"
 
 
 def test_a_turn_ended_by_the_budget_reports_a_designed_stop_not_a_failure(tmp_path):
