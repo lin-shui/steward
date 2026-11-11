@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steward · Episodes</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #151a21; --line: #232a34; --text: #d7dee8; --dim: #8b97a8;
+    --accent: #4aa3ff; --ok: #3fb950; --bad: #f85149; --warn: #d29922; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 13px/1.5 -apple-system, "Helvetica Neue", sans-serif; display: grid;
+         grid-template-rows: auto 1fr; height: 100vh; overflow: hidden; }
+  header { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0 8px 0 0; }
+  header .grow { flex: 1; }
+  select, button, input { background: #0b0f14; color: var(--text); border: 1px solid var(--line); border-radius: 5px;
+                           padding: 3px 7px; font: inherit; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .badge { padding: 1px 6px; border-radius: 10px; font-size: 11px; border: 1px solid var(--line); color: var(--dim); }
+  .badge.ok { color: var(--ok); border-color: #1d3a24; }
+  .badge.bad { color: var(--bad); border-color: #4a1f1f; }
+  .badge.warn { color: var(--warn); border-color: #40331a; }
+  .badge.live { color: #0e1116; background: var(--ok); border-color: var(--ok); font-weight: 600; }
+  main { display: grid; grid-template-columns: 300px minmax(360px, 1fr) 420px; min-height: 0; }
+  #tree { border-right: 1px solid var(--line); overflow: auto; padding: 8px; }
+  #tree h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 12px 4px 4px; }
+  .ep { padding: 5px 7px; border-radius: 6px; cursor: pointer; display: grid; grid-template-columns: 14px 1fr auto; gap: 6px; align-items: baseline; }
+  .ep:hover { background: #1b2230; }
+  .ep.sel { background: #1d2a3d; outline: 1px solid #2c4a6e; }
+  .ep .name { font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ep .meta { color: var(--dim); font-size: 10.5px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 5px; background: var(--dim); }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .dot.unk { background: #555; } .dot.warn { background: var(--warn); }
+  #stage { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; min-height: 0; }
+  #viewwrap { position: relative; background: #000; min-height: 0; display: grid; place-items: center; }
+  #world { width: 100%; height: 100%; object-fit: contain; }
+  #overlay { position: absolute; left: 0; top: 0; right: 0; padding: 5px 10px; font-size: 11px; color: #cbd5e1;
+             background: linear-gradient(#0e1116cc, #0e111600); pointer-events: none; }
+  #controls { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-top: 1px solid var(--line); background: var(--panel); }
+  #controls input[type=range] { flex: 1; }
+  #records { border-left: 1px solid var(--line); min-width: 0; min-height: 0; display: grid; grid-template-rows: auto 1fr; }
+  #tabs { display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  #tabs button { border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; background: transparent; color: var(--dim); }
+  #tabs button.on { background: var(--bg); color: var(--text); border-color: var(--line); }
+  #panels { overflow: auto; padding: 10px; }
+  pre { font-family: var(--mono); font-size: 11.5px; background: #0b0f14; border: 1px solid var(--line); border-radius: 6px;
+        padding: 8px; overflow: auto; max-height: 46vh; margin: 6px 0; white-space: pre-wrap; }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 2px 8px; font-size: 12px; }
+  .kv b { color: var(--dim); font-weight: 500; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; background: var(--panel); }
+  .card h4 { margin: 0 0 6px; font-size: 12px; font-weight: 600; }
+  details { margin: 4px 0; }
+  summary { cursor: pointer; color: var(--dim); }
+  .diff { font-family: var(--mono); font-size: 11px; white-space: pre-wrap; }
+  .diff .add { color: var(--ok); } .diff .del { color: var(--bad); } .diff .hunk { color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; font-size: 11.5px; }
+  th, td { text-align: left; padding: 3px 5px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; }
+  .muted { color: var(--dim); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .imgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .imgrid img { width: 100%; border-radius: 6px; border: 1px solid var(--line); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Episodes</h1>
+  <select id="campaign"></select>
+  <span id="campaignInfo" class="muted"></span>
+  <span class="grow"></span>
+  <span id="mirror" class="badge">mirror: —</span>
+  <a href="/console"><button>世界 console</button></a>
+  <button id="reload">刷新</button>
+</header>
+<main>
+  <aside id="tree"><div class="muted">加载中…</div></aside>
+  <section id="stage">
+    <div id="viewwrap">
+      <img id="world" alt="world view">
+      <div id="overlay">3D：在左侧选一局 episode，回放它记录的每一步</div>
+    </div>
+    <div id="controls">
+      <button id="play" disabled>▶ 播放</button>
+      <input id="scrub" type="range" min="0" max="0" value="0" disabled>
+      <span id="counter" class="muted" style="min-width:96px">0 / 0</span>
+      <label class="muted">fps <input id="fps" type="number" value="25" min="1" max="60" style="width:56px"></label>
+    </div>
+  </section>
+  <section id="records">
+    <div id="tabs">
+      <button data-tab="cells" class="on">Cells</button>
+      <button data-tab="calls">调用</button>
+      <button data-tab="verdict">判定</button>
+      <button data-tab="worker">Worker</button>
+      <button data-tab="images">图片</button>
+    </div>
+    <div id="panels"><div class="muted">选一个 episode。</div></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { campaigns: [], campaign: null, episode: null, manifest: null, tab: 'cells',
+                frameAfter: 0, playing: false, fps: 25, playerIndex: 0, playerCount: 0 };
+
+async function api(method, path, body) {
+  const reply = await fetch(path, { method, headers: body ? { 'Content-Type': 'application/json' } : {},
+                                    body: body ? JSON.stringify(body) : undefined });
+  if (!reply.ok) throw new Error(`${path} → ${reply.status} ${await reply.text()}`);
+  const type = reply.headers.get('content-type') || '';
+  // ndjson (a .jsonl artifact) is text here: it is a stream of lines, not one JSON value.
+  return type.includes('application/json') ? reply.json() : reply.text();
+}
+
+// ------------------------------------------------------------------ campaigns
+async function loadCampaigns(keep) {
+  const data = await api('GET', '/episodes/index');
+  state.campaigns = data.campaigns || [];
+  const select = $('campaign');
+  select.innerHTML = '';
+  for (const campaign of state.campaigns) {
+    const option = document.createElement('option');
+    option.value = campaign.name;
+    option.textContent = `${campaign.name} (${campaign.episodes.length})`;
+    select.appendChild(option);
+  }
+  if (!state.campaigns.length) {
+    $('tree').innerHTML = '<div class="muted">没有配置 campaign。用 <code>steward world --campaign DIR</code> 启动，或在下面添加：</div>' +
+      '<div class="row" style="margin-top:8px"><input id="rootPath" placeholder="/path/to/campaign" style="flex:1">' +
+      '<button id="addRoot">添加</button></div>';
+    $('addRoot').onclick = async () => {
+      await api('POST', '/episodes/campaign', { path: $('rootPath').value });
+      loadCampaigns();
+    };
+    return;
+  }
+  state.campaign = keep && state.campaigns.some((c) => c.name === keep) ? keep : state.campaigns[0].name;
+  select.value = state.campaign;
+  renderTree();
+  // Open something useful right away: the newest episode that recorded world states, unless one
+  // is running -- then the mirror is already driving the 3D view and must not be switched away.
+  const episodes = current().episodes || [];
+  if (!state.episode && !episodes.some((episode) => episode.live)) {
+    const recorded = episodes.filter((episode) => episode.steps > 0)
+      .sort((a, b) => (b.mtime || 0) - (a.mtime || 0));
+    if (recorded.length) selectEpisode(recorded[0].episode);  // loads, does not start playing
+  }
+}
+
+function current() { return state.campaigns.find((c) => c.name === $('campaign').value); }
+
+function renderTree() {
+  const campaign = current();
+  if (!campaign) return;
+  $('campaignInfo').textContent =
+    `${campaign.episodes.length} episodes · ${Object.keys(campaign.tasks || {}).join(', ')}`;
+  const tree = $('tree');
+  tree.innerHTML = '';
+  const rounds = {};
+  for (const [task, info] of Object.entries(campaign.tasks || {})) rounds[task] = info.rounds || [];
+  const byTask = {};
+  for (const episode of campaign.episodes) (byTask[episode.task] ||= []).push(episode);
+  for (const [task, episodes] of Object.entries(byTask)) {
+    const heading = document.createElement('h3');
+    heading.textContent = task;
+    tree.appendChild(heading);
+    for (const round of rounds[task] || []) {
+      const line = document.createElement('div');
+      line.className = 'muted';
+      line.style.cssText = 'font-size:11px;margin:2px 4px;font-family:var(--mono)';
+      const dev = round.dev || {};
+      line.textContent = `r${round.round} ${round.revision?.slice(0, 8) || ''} · dev ${dev.successes ?? '?'}/${dev.episodes ?? '?'}` +
+        (round.rolled_back_to ? ' · rolled back' : '');
+      tree.appendChild(line);
+    }
+    const fresh = episodes.filter((e) => !e.round);
+    const rows = [...episodes].sort((a, b) => (b.round ?? -1) - (a.round ?? -1) ||
+      String(b.episode).localeCompare(String(a.episode)));
+    for (const episode of rows) tree.appendChild(episodeRow(episode));
+  }
+}
+
+function episodeRow(episode) {
+  const row = document.createElement('div');
+  row.className = 'ep' + (state.episode === episode.episode ? ' sel' : '');
+  row.dataset.episode = episode.episode;
+  const dot = document.createElement('span');
+  dot.className = 'dot ' + (episode.live ? 'warn'
+    : episode.success === true ? 'ok' : episode.success === false ? 'bad' : 'unk');
+  const name = document.createElement('span');
+  name.className = 'name';
+  const short = String(episode.episode).split('/').pop();
+  name.textContent = short;
+  name.title = episode.episode;
+  const meta = document.createElement('span');
+  meta.className = 'meta';
+  const bits = [episode.split, episode.live ? '运行中' : '', episode.claim || '',
+                episode.seconds ? `${Math.round(episode.seconds)}s` : '',
+                episode.steps ? `${episode.steps}步` : ''].filter(Boolean);
+  meta.textContent = bits.join(' · ');
+  row.append(dot, name, meta);
+  row.onclick = () => selectEpisode(episode.episode);
+  return row;
+}
+
+// ------------------------------------------------------------------- episode
+async function selectEpisode(episode) {
+  state.episode = episode;
+  renderTree();
+  let manifest;
+  try {
+    manifest = await api('GET', `/episodes/manifest?campaign=${encodeURIComponent(current().name)}` +
+                                `&episode=${encodeURIComponent(episode)}`);
+  } catch (error) {
+    // A live episode has no manifest until it ends: show what is already on disk instead.
+    const live = await api('GET', `/episodes/live?campaign=${encodeURIComponent(current().name)}` +
+                                  `&episode=${encodeURIComponent(episode)}`).catch(() => null);
+    $('panels').innerHTML = `<div class="card"><h4>${episode}</h4><div class="muted">` +
+      `${escapeHtml(error.message)}</div>` +
+      (live ? `<div class="muted" style="margin-top:6px">已写 ${live.cells.length} 个 cell · ${live.calls} 次调用 · ` +
+              `${live.steps} 步状态${live.finished ? ' · 已结束' : ' · 运行中'}</div>` : '') + `</div>`;
+    return;
+  }
+  state.manifest = manifest;
+  renderRecords();
+  await focusEpisode(manifest, episode);
+}
+
+async function focusEpisode(manifest, episode) {
+  const scenario = manifest.scenario;
+  const overlay = $('overlay');
+  if (!(manifest.steps || {}).count) {
+    $('play').disabled = true; $('scrub').disabled = true;
+    overlay.textContent = `${scenario} · 该局没有记录世界状态（跑的时候没开 TWIN_MIRROR）：3D 里看的是宿主当前世界`;
+    return;
+  }
+  const loaded = await api('POST', '/episodes/load',
+                           { campaign: current().name, episode });
+  state.playerCount = loaded.count || 0;
+  state.playerIndex = 0;
+  $('scrub').max = Math.max(0, state.playerCount - 1);
+  $('scrub').value = 0;
+  $('scrub').disabled = false;
+  // The host picks the trace's own rate for 1x playback; the box is how many rows per second.
+  if (loaded.fps) $('fps').value = Math.max(1, Math.round(loaded.fps * 10) / 10);
+  $('play').disabled = false;
+  $('play').textContent = '▶ 播放';
+  $('counter').textContent = `1 / ${state.playerCount}`;
+  overlay.textContent = `${scenario} · 回放 ${state.playerCount} 步（暂停的宿主世界，纯运动学）`;
+  await aimCamera();
+}
+
+async function aimCamera() {
+  try {
+    const info = await api('GET', '/console/state');
+    const view = info.view || {};
+    await api('POST', '/console/view', { camera: { lookat: view.lookat, distance: view.distance,
+                                                  azimuth: view.azimuth, elevation: view.elevation },
+                                         fps: 15, width: 960, height: 720 });
+    state.frameAfter = 0;
+  } catch (error) { /* the world may not be loaded yet */ }
+}
+
+// ------------------------------------------------------------------ playback
+async function seek(index) {
+  const status = await api('POST', '/episodes/seek', { index });
+  state.playerIndex = status.index;
+  $('scrub').value = status.index;
+  $('counter').textContent = `${status.index + 1} / ${status.count}`;
+}
+
+$('play').onclick = async () => {
+  if (!state.episode) return;
+  if (state.playing) {
+    await api('POST', '/episodes/pause');
+    state.playing = false;
+    $('play').textContent = '▶ 播放';
+  } else {
+    await api('POST', '/episodes/play', { fps: Number($('fps').value) || 25 });
+    state.playing = true;
+    $('play').textContent = '⏸ 暂停';
+  }
+};
+$('scrub').oninput = async (event) => { await seek(Number(event.target.value)); };
+$('fps').onchange = () => { if (state.playing) api('POST', '/episodes/play', { fps: Number($('fps').value) || 25 }); };
+$('campaign').onchange = () => { state.episode = null; loadCampaigns($('campaign').value); };
+$('reload').onclick = () => loadCampaigns(state.campaign);
+
+async function pollPlayback() {
+  try {
+    const status = await api('GET', '/episodes/status');
+    if (status.count) {
+      state.playerIndex = status.index;
+      if (!document.activeElement || document.activeElement.id !== 'scrub') $('scrub').value = status.index;
+      $('counter').textContent = `${status.index + 1} / ${status.count}`;
+      if (state.playing !== status.playing) {
+        state.playing = status.playing;
+        $('play').textContent = status.playing ? '⏸ 暂停' : '▶ 播放';
+      }
+      if (status.error) $('overlay').textContent = `回放出错：${status.error}`;
+    }
+  } catch (error) { /* keep polling */ }
+}
+
+// -------------------------------------------------------------------- frames
+async function pullFrame() {
+  try {
+    const reply = await fetch(`/console/frame?view=world&after=${state.frameAfter}`);
+    if (reply.status === 200) {
+      state.frameAfter = Number(reply.headers.get('X-Frame-Index') || state.frameAfter);
+      const blob = await reply.blob();
+      $('world').src = URL.createObjectURL(blob);
+    }
+  } catch (error) { /* the view loop is idle */ }
+}
+
+async function pollMirror() {
+  try {
+    const status = await api('GET', '/mirror/status');
+    const badge = $('mirror');
+    if (status.episode) {
+      const age = status.updated_ago_s;
+      badge.className = 'badge live';
+      badge.textContent = `LIVE ${status.episode} · seq ${status.seq} · t ${status.t}s`;
+      badge.title = `scenario ${status.scenario} · ${status.states} states · last ${age}s ago` +
+                    (status.missing?.length ? ` · missing ${status.missing.join(',')}` : '');
+      // The mirrored episode may have switched the host's scenario: re-frame the view once.
+      if (status.scenario && status.scenario !== state.liveScenario) {
+        state.liveScenario = status.scenario;
+        $('overlay').textContent = `LIVE ${status.scenario} — 世界由正在跑的 episode 驱动（暂停的宿主世界）`;
+        aimCamera();
+      }
+    } else {
+      badge.className = 'badge';
+      badge.textContent = 'mirror: 无';
+    }
+  } catch (error) { /* older host */ }
+}
+
+// ------------------------------------------------------------------- records
+function escapeHtml(text) {
+  return String(text ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function diffHtml(text) {
+  return String(text || '').split('\n').map((line) => {
+    const cls = line.startsWith('+') && !line.startsWith('+++') ? 'add'
+      : line.startsWith('-') && !line.startsWith('---') ? 'del'
+      : line.startsWith('@@') ? 'hunk' : '';
+    return `<span class="${cls}">${escapeHtml(line)}</span>`;
+  }).join('\n');
+}
+
+function renderRecords() {
+  const manifest = state.manifest;
+  if (!manifest) return;
+  const identity = manifest.identity || {}, outcome = manifest.outcome || {};
+  const panels = $('panels');
+  if (state.tab === 'cells') {
+    panels.innerHTML = (manifest.records?.cells || []).map((cell) => `
+      <div class="card"><h4>cell ${cell.index} · ${escapeHtml(cell.file)}</h4>
+        <pre>${escapeHtml(cell.code)}</pre>
+        ${cell.stdout ? `<details open><summary>stdout</summary><pre>${escapeHtml(cell.stdout)}</pre></details>` : ''}
+        ${cell.stderr ? `<details open><summary>stderr / exception</summary><pre>${escapeHtml(cell.stderr)}</pre></details>` : ''}
+      </div>`).join('') || '<div class="muted">没有 cell。</div>';
+  } else if (state.tab === 'calls') {
+    panels.innerHTML = `<div class="card"><h4>调用流水</h4>
+      <div class="kv"><b>calls</b><span>${outcome.calls ?? '—'} 次原语调用</span>
+        <b>env steps</b><span>${outcome.env_steps ?? '—'}</span>
+        <b>cells</b><span>${outcome.cells ?? '—'}</span></div></div>
+      <div class="card"><h4>原始记录</h4>
+        <div class="muted">calls.jsonl / tool_turns.json / messages.json 都可以在这里直接打开：</div>
+        <div class="row" style="margin-top:6px">
+          <button data-art="calls.jsonl">calls.jsonl</button>
+          <button data-art="tool_turns.json">tool_turns.json</button>
+          <button data-art="messages.json">messages.json</button>
+          <button data-art="prompt.txt">prompt.txt</button>
+        </div><pre id="artpre" style="display:none"></pre></div>`;
+    for (const button of panels.querySelectorAll('[data-art]')) button.onclick = () => showArtifact(button.dataset.art);
+  } else if (state.tab === 'verdict') {
+    const finish = outcome.finish || {};
+    panels.innerHTML = `<div class="card"><h4>判定</h4>
+      <div class="kv">
+        <b>环境判定</b><span class="${outcome.environment_success ? '' : ''}">${outcome.environment_success === true ? '成功' : outcome.environment_success === false ? '失败' : '—'}</span>
+        <b>模型自称</b><span>${escapeHtml(finish.status || '—')}</span>
+        <b>一致性</b><span>${escapeHtml(identity.claim || '—')}</span>
+        <b>结束原因</b><span>${escapeHtml(outcome.end || '—')}</span>
+        <b>耗时</b><span>${outcome.seconds ? Math.round(outcome.seconds) + ' s' : '—'}</span>
+        <b>revision</b><span style="font-family:var(--mono)">${escapeHtml(identity.revision || '—')}</span>
+        <b>布局</b><span>${escapeHtml(identity.split || '')} l${escapeHtml(identity.layout)}</span>
+      </div>
+      ${finish.summary ? `<div class="muted" style="margin-top:8px">${escapeHtml(finish.summary)}</div>` : ''}
+    </div>
+    <div class="card"><h4>本次 episode</h4>
+      <div class="kv"><b>scenario</b><span style="font-family:var(--mono)">${escapeHtml(manifest.scenario)}</span>
+        <b>模型</b><span>${escapeHtml(manifest.model || '—')} (${escapeHtml(manifest.runtime || '—')})</span>
+        <b>世界状态</b><span>${manifest.steps?.count || 0} 步${manifest.steps?.count ? '' : '（未开镜像）'}</span>
+        <b>帧</b><span>${manifest.frames?.count || 0} 组</span></div></div>`;
+  } else if (state.tab === 'worker') {
+    panels.innerHTML = workerHtml(manifest);
+    for (const button of panels.querySelectorAll('[data-art]')) button.onclick = () => showArtifact(button.dataset.art);
+    for (const button of panels.querySelectorAll('[data-camp-art]')) button.onclick = () => showArtifact(button.dataset.campArt, 'campaign');
+    for (const link of panels.querySelectorAll('[data-open]')) link.onclick = (event) => {
+      event.preventDefault();
+      selectEpisode(link.dataset.open);
+    };
+  } else {
+    panels.innerHTML = imagesHtml(manifest);
+    for (const input of panels.querySelectorAll('[data-frame]')) input.onchange = () => renderImages(manifest);
+    renderImages(manifest);
+  }
+}
+
+function workerHtml(manifest) {
+  const worker = manifest.worker;
+  if (!worker) {
+    return `<div class="card"><h4>Worker</h4><div class="muted">这一局没有 worker 轮次（v0 或 demo 重放）。</div></div>`;
+  }
+  const races = worker.replays || [];
+  return `<div class="card"><h4>worker 轮次 r${worker.round}</h4>
+      <div class="kv">
+        <b>parent</b><span style="font-family:var(--mono)">${escapeHtml(worker.parent || 'v0')}</span>
+        <b>revision</b><span style="font-family:var(--mono)">${escapeHtml(worker.revision)}</span>
+        <b>结论</b><span>${worker.accepted?.accepted ? '接受' : '拒绝'}${worker.accepted?.changed === false ? '（无改动）' : ''}</span>
+        <b>worker</b><span>exit ${escapeHtml(worker.worker?.exit ?? '—')} · ${Math.round(worker.worker?.seconds || 0)} s · ` +
+        `${worker.worker?.turns ?? '—'} turns · $${(worker.worker?.cost_usd || 0).toFixed(2)}</span>
+        <b>会话</b><span style="font-family:var(--mono)">${escapeHtml(worker.session)}</span>
+      </div></div>
+    <div class="card"><h4>replay 验证</h4>
+      <table><thead><tr><th>布局</th><th>结果</th><th>end</th><th>耗时</th><th>episode</th></tr></thead><tbody>
+      ${races.map((replay) => `<tr><td>l${replay.layout}</td>
+        <td>${replay.success === true ? '✓' : replay.success === false ? '✗' : '—'}</td>
+        <td>${escapeHtml(replay.end || '—')}</td><td>${Math.round(replay.seconds || 0)} s</td>
+        <td>${replay.episode ? `<a href="#" data-open="${escapeHtml(replay.episode)}">打开</a>` : '<span class="muted">—</span>'}</td></tr>`).join('') ||
+        '<tr><td colspan="5" class="muted">没有 replay。</td></tr>'}
+      </tbody></table></div>
+    ${(worker.diff || []).map((change) => `<div class="card"><h4>${escapeHtml(change.path)} <span class="muted">(${change.status})</span></h4>
+        <div class="diff">${diffHtml(change.diff)}</div></div>`).join('')}
+    <div class="card"><h4>FINDINGS</h4><pre>${escapeHtml(worker.findings || '（没有）')}</pre></div>
+    <div class="card"><h4>worker 的调用流</h4>
+      ${manifest.worker_trace ? `<button data-camp-art="${escapeHtml(manifest.worker_trace)}">打开 transcript</button>
+        <div id="traceOut"></div>` : '<div class="muted">没有保留 transcript。</div>'}</div>`;
+}
+
+function imagesHtml(manifest) {
+  // Frames live next to the manifest: <episode>/episode/steps/NNNN/cam_*.png
+  const names = (manifest.frames?.names || []).map((name) => name);
+  const cameras = manifest.frames?.cameras || [];
+  const last = names[0] || '0000';
+  return `<div class="card"><h4>相机帧（模型看到的）</h4>
+    <div class="row"><label class="muted">step <input id="frameStep" data-frame type="number"
+      min="0" max="${Math.max(0, (manifest.frames?.count || 1) - 1)}" value="${parseInt(last, 10) || 0}" style="width:80px"></label>
+      <span class="muted">共 ${manifest.frames?.count || 0} 组 · ${cameras.join(', ')}</span></div>
+    <div class="imgrid" id="frameGrid"></div></div>`;
+}
+
+function renderImages(manifest) {
+  const input = $('frameStep');
+  const grid = $('frameGrid');
+  if (!grid) return;
+  const step = String(Math.max(0, Number(input?.value) || 0)).padStart(4, '0');
+  const base = `${manifest.episode}/episode/steps/${step}`;
+  const cameras = manifest.frames?.cameras || [];
+  grid.innerHTML = cameras.map((camera) =>
+    `<figure style="margin:0"><img src="/episodes/artifact?campaign=${encodeURIComponent(manifest.campaign)}` +
+    `&path=${encodeURIComponent(base + '/' + camera + '.png')}" alt="${camera}">` +
+    `<figcaption class="muted">${camera}</figcaption></figure>`).join('') ||
+    '<div class="muted">这一局没有保存相机帧。</div>';
+}
+
+async function showArtifact(relative, scope) {
+  const pre = document.createElement('pre');
+  const where = document.getElementById('traceOut') || $('panels').lastElementChild || $('panels');
+  where.appendChild(pre);
+  pre.textContent = '…';
+  const path = scope === 'campaign' ? relative : `${state.episode}/episode/${relative}`;
+  try {
+    const text = await api('GET', `/episodes/artifact?campaign=${encodeURIComponent(current().name)}` +
+                                 `&path=${encodeURIComponent(path)}`);
+    pre.textContent = String(text).slice(0, 200000);
+    if (relative.includes('worker.stream')) pre.textContent = summarizeWorkerTrace(String(text));
+  } catch (error) { pre.textContent = error.message; }
+}
+
+function summarizeWorkerTrace(text) {
+  // dsh stream: keep the readable events -- tool calls, their results and the final text.
+  const lines = [];
+  for (const line of text.split('\n')) {
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    const inner = event.event || event;
+    const kind = inner.type || event.type || '';
+    if (kind === 'tool_call') lines.push(`→ ${inner.name || inner.tool || '?'} ${JSON.stringify(inner.input || {}).slice(0, 300)}`);
+    else if (kind === 'tool_result') lines.push(`   ${String(inner.output || inner.result || '').slice(0, 300)}`);
+    else if (kind === 'text') lines.push(`# ${String(inner.text || '').slice(0, 400)}`);
+    else if (kind === 'final' || kind === 'result') lines.push(`== ${JSON.stringify(inner).slice(0, 2000)}`);
+  }
+  return lines.join('\n') || '(没有可读事件)';
+}
+
+$('tabs').onclick = (event) => {
+  const tab = event.target.dataset?.tab;
+  if (!tab) return;
+  state.tab = tab;
+  for (const button of $('tabs').querySelectorAll('button')) button.classList.toggle('on', button.dataset.tab === tab);
+  renderRecords();
+};
+
+// --------------------------------------------------------------------- loops
+setInterval(pullFrame, 120);
+setInterval(pollPlayback, 400);
+setInterval(pollMirror, 1500);
+loadCampaigns();
+pullFrame();
+pollMirror();
+</script>
+</body>
+</html>

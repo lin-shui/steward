@@ -87,6 +87,7 @@ def _host(args, run_dir: Path, start: bool = True):
                        phase=args.phase, fallback_phase=LATEST_PHASE, bind_wait_s=getattr(args, "bind_wait", 0.0),
                        pause_on_perception_fault=getattr(args, "pause_on_perception_fault", False),
                        freeze_idle=args.freeze_idle, body=getattr(args, "body", None),
+                       campaigns=getattr(args, "campaign", None),
                        dispatch_task=getattr(args, "dispatch_task", False),
                        misnames=load_misnames(args.misnames_config) if getattr(args, "misnames_config", "") else None)
     return host.start() if start else host
@@ -872,6 +873,10 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--misnames-config", default=str(MISNAMES_CONFIG),
                        help="names the ideal detections report instead of true categories at the phase0-misnamed level; '' disables it")
         if not in_process:
+            p.add_argument("--campaign", action="append", default=None, metavar="DIR",
+                           help="a learning campaign directory whose episodes the console's /episodes page lists "
+                                "and replays (repeatable); an episode run elsewhere can also be mirrored into "
+                                "this world live through POST /mirror/state")
             p.add_argument("--bind-wait", type=float, default=10.0,
                            help="seconds to wait for a fixed port still held by a service that just stopped")
             p.add_argument("--body", choices=list(EMBODIMENTS), default=None,

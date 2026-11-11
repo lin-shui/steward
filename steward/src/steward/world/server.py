@@ -33,6 +33,8 @@ from steward.glrender import IMAGE_FORMATS
 from steward.net import NO_CONTENT, Binary, HttpError, JsonServer, call, fetch
 from steward.observer.observer import Observer
 from steward.world.console import CONSOLE_HTML, console_state
+from steward.world.episodes import episode_routes
+from steward.world.mirror import mirror_routes
 from steward.phases import DEFAULT_PHASE, phase_catalog, phase_modules
 from steward.scene.extent import entity_body_ids
 from steward.scene.mjcf import build_mjcf
@@ -86,7 +88,7 @@ class StewardHost:
                  chat: ChatConfig | None = None, phase: str | None = None, fallback_phase: str = DEFAULT_PHASE,
                  bind_wait_s: float = 0.0, pause_on_perception_fault: bool = False, freeze_idle: bool = False,
                  appearance: str = "flat", misnames: dict[str, str] | None = None, body: str | None = None,
-                 dispatch_task: bool = False):
+                 campaigns: list[Path | str] | None = None, dispatch_task: bool = False):
         # ``phase`` pins the level for every episode; None: each scenario's declared level, or
         # ``fallback_phase`` for a scenario that declares none.
         phase_modules(phase or fallback_phase)
@@ -100,6 +102,8 @@ class StewardHost:
         self._fallback_phase = fallback_phase
         self.phase = phase or fallback_phase
         self.authoring = AuthoringService(root)
+        # Campaign directories whose recorded episodes the console lists and replays (--campaign).
+        self.episode_roots = [Path(directory) for directory in (campaigns or [])]
         self.chat = HarnessChat(chat, lambda: self.wca.url)
         # Session files of reset episodes, whose thinking the console no longer shows.
         self.stale_sessions: frozenset[str] = frozenset()
@@ -481,6 +485,8 @@ class StewardHost:
             ("POST", "/console/chat/reset"): guard(lambda q, b: self.chat.reset(b.get("agent", "world"))),
             ("POST", "/console/chat/stop"): guard(lambda q, b: self.chat.cancel(b.get("agent", "world"))),
             ("POST", "/console/alerts/ack"): guard(lambda q, b: self.acknowledge_alerts()),
+            **mirror_routes(self),
+            **episode_routes(self),
         }
 
     # ------------------------------------------------- perception fault monitor

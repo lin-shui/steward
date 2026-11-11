@@ -271,6 +271,50 @@ class WorldSim:
             self._load(copy.deepcopy(self._initial_scene))
             self.events = [{"t": 0.0, "type": "episode/reset"}]
 
+    # -------------------------------------------------------------- mirroring
+    def joint_state(self) -> dict[str, list[float]]:
+        """Every joint's position by name: the robot's, its grippers', and the free bodies'.
+
+        Keyed by joint name rather than qpos offset so a recorded state can be replayed into
+        another build of the same scene (and survive a rebuild of this one).
+        """
+        with self.lock:
+            state: dict[str, list[float]] = {}
+            for j in range(self.model.njnt):
+                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j)
+                width = _JOINT_WIDTH[int(self.model.jnt_type[j])][0]
+                at = self.model.jnt_qposadr[j]
+                state[name] = [float(v) for v in self.data.qpos[at : at + width]]
+            return state
+
+    def apply_joint_state(self, state: dict[str, list[float]], time: float | None = None) -> dict:
+        """Put the world into ``state`` (joint name -> position) and re-derive its kinematics.
+
+        Mirroring and episode playback both use this: the sender owns the physics, so nothing is
+        integrated here -- qpos is written, the clock set, ``mj_forward`` run so contacts, body
+        poses and the renderer follow. Joints present on only one side are left alone and
+        reported back, which is how a scene that does not match the recording shows up.
+        """
+        written, missing, mismatched = 0, [], []
+        with self.lock:
+            for j in range(self.model.njnt):
+                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j)
+                values = state.get(name)
+                width = _JOINT_WIDTH[int(self.model.jnt_type[j])][0]
+                if values is None:
+                    missing.append(name)
+                    continue
+                if len(values) != width:
+                    mismatched.append(name)
+                    continue
+                at = self.model.jnt_qposadr[j]
+                self.data.qpos[at : at + width] = [float(v) for v in values]
+                written += 1
+            if time is not None:
+                self.data.time = float(time)
+            mujoco.mj_forward(self.model, self.data)
+        return {"written": written, "missing": missing, "mismatched": mismatched}
+
     # ------------------------------------------------------------- live edits
     def placement_pose(self, spec: dict, current: dict | None = None) -> dict:
         """Root pose for a placement: ``at`` {x, y, yaw?, z?} on the floor, or ``on`` a support
